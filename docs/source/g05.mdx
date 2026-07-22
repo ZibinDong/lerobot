@@ -1,0 +1,46 @@
+# G0.5
+
+G0.5 combines a Qwen3.5 vision-language backbone with a flow-matching action expert. The integration follows the regular LeRobot policy contract: `G05Config`, `G05Policy`, and serializable pre/postprocessor pipelines all use the registry name `g05`.
+
+## Install
+
+```bash
+uv sync --extra g05 --extra training
+```
+
+## Convert an official checkpoint
+
+The converter creates a self-contained directory. It copies the Qwen tokenizer, converts the released ActionCodec into its own Hugging Face `config.json` and `model.safetensors`, embeds normalization and feature-layout metadata in the policy config, and writes the policy tensors as safetensors. The resulting runtime does not access the source G0.5 repository or any external model repository.
+
+```bash
+uv run python -m lerobot.policies.g05.convert_g05_checkpoint \
+  --legacy-root /path/to/G05 \
+  --metadata-root /path/to/g05-sidecars \
+  --processor-dir /path/to/g05-sidecars/qwen3_5_2b_base_processor \
+  --variant g05-libero \
+  --n-action-steps 10 \
+  --output-dir /path/to/lerobot-g05-libero
+```
+
+The converter refuses unresolved layouts, vocabulary mismatches, missing weights, unexpected weights, and shape mismatches. Never copy optimizer or scheduler state into the converted artifact.
+
+For checkpoints containing several robot schemas, pass `--embodiment` so the artifact has one explicit physical state/action contract. Continuous flow training/inference and teacher-forced discrete action-token training are supported. SO101 inference additionally requires autoregressive CoT generation and currently fails explicitly instead of returning an incorrectly conditioned action.
+
+## Load
+
+```python
+from lerobot.policies.g05.configuration_g05 import G05Config
+from lerobot.policies.g05.modeling_g05 import G05Policy
+from lerobot.policies.factory import make_pre_post_processors
+
+path = "/path/to/lerobot-g05-libero"
+config = G05Config.from_pretrained(path)
+policy = G05Policy.from_pretrained(path, config=config, strict=True)
+preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=path)
+```
+
+Keep `config.json`, policy safetensors, both processor JSON files, their state files, `processor/`, `action_tokenizer/`, and `conversion.json` together. The ActionCodec subdirectory is a standard local Hugging Face model and is required even when a continuous-only policy does not load it at runtime. Moving only the policy weights is unsupported.
+
+## Published checkpoint defaults
+
+All published checkpoints predict 32 actions. The recommended execution windows are 10 for LIBERO, 16 for DROID, 32 for SO101, and 16 for the base checkpoint. These values are conversion-time configuration, not model branches.
