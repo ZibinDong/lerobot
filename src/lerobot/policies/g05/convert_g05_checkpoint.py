@@ -15,6 +15,7 @@ from typing import Any
 
 import torch
 from huggingface_hub import save_torch_state_dict
+from safetensors import safe_open
 from torch import Tensor
 from transformers import AutoTokenizer
 
@@ -25,6 +26,13 @@ from .action_tokenizer import G05ActionCodecConfig, G05ActionCodecModel
 from .configuration_g05 import G05Config
 from .modeling_g05 import G05Policy
 from .processor_g05 import make_g05_pre_post_processors
+
+PUBLISHED_VARIANT_DEFAULTS = {
+    "g05-base": {"embodiment": "galaxea_r1lite", "n_action_steps": 16},
+    "g05-libero": {"embodiment": "libero", "n_action_steps": 10},
+    "g05-droid": {"embodiment": "Droid_Franka", "n_action_steps": 16},
+    "g05-so101": {"embodiment": "so100", "n_action_steps": 32},
+}
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -82,7 +90,7 @@ def _layout_indices(
 
 
 def _select_embodiment(hydra: dict[str, Any], stats: dict[str, Any], requested: str | None) -> str:
-    embodiment = requested or hydra.get("eval_embodiment")
+    embodiment = requested or hydra.get("eval_embodiment") or hydra.get("data", {}).get("embodiment")
     if embodiment is None and len(stats) == 1:
         embodiment = next(iter(stats))
     if embodiment is None:
@@ -119,17 +127,94 @@ def _droid_shape_meta() -> dict[str, list[dict[str, Any]]]:
     }
 
 
+def _canonical_shape_meta(shape_meta: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Normalize both published and exported-training shape schemas."""
+
+    canonical: dict[str, list[dict[str, Any]]] = {"action": [], "state": [], "images": []}
+    for target_section, source_section in (("action", "action"), ("state", "state"), ("state", "proprio")):
+        if canonical[target_section] or source_section not in shape_meta:
+            continue
+        source_offsets: dict[str, int] = {}
+        for item in shape_meta[source_section]:
+            if "shape" in item:
+                canonical[target_section].append(dict(item))
+                continue
+            sources = item.get("sources") or []
+            if len(sources) != 1:
+                raise ValueError(f"G0.5 {source_section} part {item.get('key')!r} must have one source")
+            source = sources[0]
+            width = source.get("raw_shape")
+            if not isinstance(width, int):
+                raise ValueError(f"G0.5 {source_section} part {item.get('key')!r} has no scalar width")
+            source_key = source["lerobot_key"]
+            start_index = int(source.get("start_index", 0))
+            expected_start = source_offsets.get(source_key, 0)
+            if start_index != expected_start:
+                raise ValueError(
+                    f"G0.5 {source_section} source {source_key!r} has non-contiguous or "
+                    f"out-of-order offset {start_index}; expected {expected_start}"
+                )
+            source_offsets[source_key] = start_index + width
+            canonical[target_section].append({"key": item["key"], "lerobot_key": source_key, "shape": width})
+
+    for item in shape_meta.get("images", []):
+        if "lerobot_key" in item or item.get("dummy", False):
+            canonical["images"].append(dict(item))
+            continue
+        sources = item.get("sources") or []
+        if len(sources) != 1:
+            raise ValueError(f"G0.5 image part {item.get('key')!r} must have one source")
+        source_key = sources[0].get("lerobot_key")
+        # Training exports can randomize physical cameras into anonymous slots.
+        # Deployment uses the semantic part name recorded alongside that slot.
+        if not source_key or ".random_slot_" in source_key:
+            source_key = f"observation.images.{item['key']}"
+        canonical["images"].append({"key": item["key"], "lerobot_key": source_key})
+
+    if not all(canonical.values()):
+        raise ValueError("G0.5 shape metadata must define action, state/proprio, and images")
+    return canonical
+
+
+def _processor_contract(processor: dict[str, Any]) -> dict[str, Any]:
+    """Flatten the sequential processor format stored by newer training exports."""
+
+    if "steps" not in processor:
+        return processor
+    contract: dict[str, Any] = {}
+    for step in processor["steps"]:
+        target = str(step.get("_target_", ""))
+        if target.endswith("LinearNormalizer"):
+            contract.update(
+                norm_default_mode=step.get("default_mode"),
+                norm_exception_mode=step.get("exception_mode") or {},
+                use_stepwise_action_norm=step.get("use_stepwise_action_norm"),
+            )
+        elif target.endswith(("PaddingActionMerger", "ActionStateMerger")):
+            contract["action_state_merger"] = {"merge_spec": step.get("merge_spec")}
+        elif target.endswith("RelativeJointTransform"):
+            contract.setdefault("action_state_transforms", []).append(step)
+        elif target.endswith("G05ModelBoundaryTransform"):
+            contract["image_keys"] = step.get("image_keys")
+    return contract
+
+
 def _embodiment_metadata(hydra: dict[str, Any], embodiment: str) -> tuple[dict[str, Any], dict[str, Any]]:
     data = hydra["data"]
     if isinstance(data, dict):
+        # Newer stripped training exports store one resolved embodiment directly.
+        if data.get("shape_meta") is not None:
+            if data.get("embodiment") not in {None, embodiment}:
+                raise ValueError("the requested embodiment does not match the exported training bundle")
+            return _canonical_shape_meta(data["shape_meta"]), _processor_contract(data.get("processor", {}))
+
         processor = data.get("processors", {}).get(embodiment, {})
         dataset = data.get("embodiment_datasets", {}).get(embodiment, {})
         shape_meta = processor.get("shape_meta") or dataset.get("shape_meta")
         if shape_meta is not None:
-            return shape_meta, processor
+            return _canonical_shape_meta(shape_meta), _processor_contract(processor)
     if embodiment == "Droid_Franka":
         return _droid_shape_meta(), {
-            "norm_default_mode": "q01/q99",
             "action_state_transforms": [
                 {
                     "_target_": "g05.data_processor.transforms.relative_action.RelativeJointTransform",
@@ -141,7 +226,7 @@ def _embodiment_metadata(hydra: dict[str, Any], embodiment: str) -> tuple[dict[s
 
 
 def _merge_spec(processor: dict[str, Any], parts_meta: dict[str, int]) -> dict[str, list[str]]:
-    configured = processor["action_state_merger"].get("merge_spec")
+    configured = processor.get("action_state_merger", {}).get("merge_spec")
     if isinstance(configured, dict):
         return configured
     # Some post-training sidecars retained an oc.load expression. The action
@@ -180,20 +265,122 @@ def _normalization_specs(
     stepwise: bool,
     default_mode: str,
     exception_modes: dict[str, str],
+    section: str,
 ) -> list[dict[str, Any]]:
     prefix = "stepwise_" if stepwise else "global_"
     specs: list[dict[str, Any]] = []
     for item in shape_items:
-        mode = exception_modes.get(item["key"], default_mode)
-        if mode not in {"q01/q99", "z-score", "z-score-tail"}:
+        mode = exception_modes.get(item["key"], default_mode).removesuffix("-tail")
+        if mode not in {"z-score", "q01/q99"}:
             raise ValueError(f"normalization mode {mode!r} for {item['key']!r} is not supported")
+
+        width = int(item["shape"] if isinstance(item["shape"], int) else item["shape"][-1])
         item_stats = stats[item["key"]]
-        names = {"q01", "q99"} if mode == "q01/q99" else {"mean", "std"}
-        if mode.endswith("-tail"):
-            names.update(("q01", "q99"))
-        selected = {name: item_stats[prefix + name] for name in sorted(names)}
-        specs.append({"mode": mode, "stats": selected})
+        names = ("mean", "std") if mode == "z-score" else ("q01", "q99")
+        try:
+            selected = {name: item_stats[prefix + name] for name in names}
+        except KeyError as error:
+            raise ValueError(
+                f"published {section} statistics for {item['key']!r} do not support mode {mode!r}"
+            ) from error
+        specs.append({"mode": mode, "width": width, "stats": selected})
     return specs
+
+
+def _normalization_config(
+    model_processor: dict[str, Any], embodiment_processor: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve the normalizer contract recorded by the original Hydra config.
+
+    Post-training checkpoints can override the dataset processor at the model
+    boundary (LIBERO and DROID do this). Such an override is atomic: exception
+    modes must not leak in from the dataset's different normalizer contract.
+    """
+    model_processor = _processor_contract(model_processor)
+    embodiment_processor = _processor_contract(embodiment_processor)
+    source = model_processor if model_processor.get("norm_default_mode") is not None else embodiment_processor
+    default_mode = source.get("norm_default_mode")
+    if default_mode is None:
+        raise ValueError(
+            "the original checkpoint config does not define norm_default_mode for this embodiment"
+        )
+
+    stepwise = model_processor.get("use_stepwise_action_norm")
+    if stepwise is None:
+        stepwise = source.get("use_stepwise_action_norm")
+    if stepwise is None:
+        raise ValueError("the original checkpoint config does not define use_stepwise_action_norm")
+
+    return {
+        "default_mode": default_mode,
+        "exception_modes": source.get("norm_exception_mode") or {},
+        "use_stepwise_action_norm": bool(stepwise),
+    }
+
+
+def _camera_layout(
+    image_items: list[dict[str, Any]], output_camera_count: int
+) -> tuple[list[str], list[str], list[str]]:
+    """Translate published camera slots into explicit LeRobot feature names."""
+    so101_camera_keys = {
+        "__so100_exterior__": "observation.images.exterior_rgb",
+        "__so100_wrist_left__": "observation.images.left_wrist_rgb",
+        "__so100_wrist_right__": "observation.images.right_wrist_rgb",
+    }
+    camera_keys: list[str] = []
+    dummy_camera_keys: list[str] = []
+    camera_order: list[str] = []
+    for index, item in enumerate(image_items):
+        published_key = item.get("lerobot_key")
+        key = so101_camera_keys.get(published_key, published_key)
+        is_dummy = bool(item.get("dummy", False)) or published_key == "__so100_wrist_left__"
+        if key is None:
+            key = f"observation.images.g05_dummy_{index}"
+            is_dummy = True
+        (dummy_camera_keys if is_dummy else camera_keys).append(key)
+        camera_order.append(key)
+
+    while len(camera_order) < output_camera_count:
+        key = f"observation.images.g05_dummy_{len(camera_order)}"
+        dummy_camera_keys.append(key)
+        camera_order.append(key)
+    if len(camera_order) != output_camera_count:
+        raise ValueError("shape metadata contains more cameras than the model processor accepts")
+    return camera_keys, dummy_camera_keys, camera_order
+
+
+def _exported_action_tokens(metadata_dir: Path) -> list[str] | None:
+    """Read the authoritative token order from a self-contained training export."""
+
+    path = metadata_dir / "input_processor" / "input_processor_config.json"
+    if not path.is_file():
+        return None
+    with path.open() as stream:
+        metadata = json.load(stream)
+    added = metadata.get("added_tokens")
+    if not isinstance(added, dict) or not added:
+        raise ValueError("exported input processor has no added-token mapping")
+    ordered = sorted(added.items(), key=lambda item: item[1])
+    ids = [int(index) for _, index in ordered]
+    if ids != list(range(ids[0], ids[0] + len(ids))):
+        raise ValueError("exported input processor token IDs are not contiguous")
+    tokens = [token for token, _ in ordered]
+    if tokens[-2:] != ["<EOV>", "<state>"]:
+        raise ValueError("exported G0.5 vocabulary must end with EOV and state tokens")
+    return tokens[:-2]
+
+
+def _action_tokenizer_config(hydra: dict[str, Any], source: Path) -> dict[str, Any]:
+    frontend = hydra["model"]["model_arch"]["AT_CONFIG"]
+    if not isinstance(frontend, dict):
+        frontend = hydra["tokenizer"]["vq_config"]
+    if isinstance(frontend.get("model_arch"), dict):
+        return frontend
+    if not source.is_dir() or not (source / "config.json").is_file():
+        raise ValueError("the ActionCodec architecture is absent from Hydra; pass its HF export directory")
+    with (source / "config.json").open() as stream:
+        architecture = json.load(stream)
+    return {**frontend, "model_arch": architecture}
 
 
 def _action_tokens(model_config: dict[str, Any]) -> list[str]:
@@ -217,10 +404,7 @@ def _save_action_tokenizer(
     tokenizer_config: dict[str, Any],
     output_dir: Path,
 ) -> None:
-    """Convert the legacy pickled codec into a standalone HF model directory."""
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=True)
-    source = checkpoint.get("model_state_dict", checkpoint)
-    source = {key.removeprefix("model."): value.contiguous() for key, value in source.items()}
+    """Convert or validate an exported ActionCodec as a standalone HF model."""
     frontend_fields = {
         name: tokenizer_config[name]
         for name in (
@@ -235,6 +419,48 @@ def _save_action_tokenizer(
         if name in tokenizer_config
     }
     config = G05ActionCodecConfig(**tokenizer_config["model_arch"], **frontend_fields)
+
+    if checkpoint_path.is_dir():
+        weights_path = checkpoint_path / "model.safetensors"
+        if not weights_path.is_file():
+            raise FileNotFoundError(f"missing ActionCodec safetensors: {weights_path}")
+        with torch.device("meta"):
+            expected = G05ActionCodecModel(config).state_dict()
+        training_only_keys = {
+            "action_time_contrastive_loss.logit_bias",
+            "action_time_contrastive_loss.logit_scale",
+        }
+        with safe_open(weights_path, framework="pt") as stream:
+            serialized_keys = set(stream.keys())
+            source_keys = serialized_keys - training_only_keys
+            bad_shapes = {
+                key: (tuple(stream.get_slice(key).get_shape()), tuple(expected[key].shape))
+                for key in source_keys & set(expected)
+                if tuple(stream.get_slice(key).get_shape()) != tuple(expected[key].shape)
+            }
+            tensors = (
+                {key: stream.get_tensor(key) for key in source_keys}
+                if serialized_keys != source_keys
+                else None
+            )
+        missing = set(expected) - source_keys
+        unexpected = source_keys - set(expected)
+        if missing or unexpected or bad_shapes:
+            raise ValueError(
+                f"ActionCodec weight mapping failed: missing={sorted(missing)}, "
+                f"unexpected={sorted(unexpected)}, bad_shapes={bad_shapes}"
+            )
+        output_dir.mkdir(parents=True)
+        config.save_pretrained(output_dir)
+        if tensors is None:
+            shutil.copy2(weights_path, output_dir / weights_path.name)
+        else:
+            save_torch_state_dict(tensors, output_dir, max_shard_size="5GB")
+        return
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=True)
+    source = checkpoint.get("model_state_dict", checkpoint)
+    source = {key.removeprefix("model."): value.contiguous() for key, value in source.items()}
     with torch.device("meta"):
         expected = G05ActionCodecModel(config).state_dict()
     missing = set(expected) - set(source)
@@ -260,6 +486,10 @@ def _build_config(
     state: dict[str, Tensor],
     n_action_steps: int,
     embodiment: str | None = None,
+    *,
+    use_lerobot_normalization: bool = False,
+    tokenizer_config: dict[str, Any] | None = None,
+    action_tokens: list[str] | None = None,
 ) -> tuple[G05Config, list[str]]:
     model = hydra["model"]
     architecture = model["model_arch"]
@@ -271,58 +501,82 @@ def _build_config(
         shape_meta["state"],
         shape_meta["images"],
     )
-    tokenizer_config = architecture["AT_CONFIG"]
-    if not isinstance(tokenizer_config, dict):
-        tokenizer_config = hydra["tokenizer"]["vq_config"]
+    if tokenizer_config is None:
+        tokenizer_config = architecture["AT_CONFIG"]
+        if not isinstance(tokenizer_config, dict):
+            tokenizer_config = hydra["tokenizer"]["vq_config"]
     parts_meta = tokenizer_config["parts_meta"]
     merge_spec = _merge_spec(processor, parts_meta)
     action_indices = _layout_indices(action_items, merge_spec, parts_meta)
     state_indices = _layout_indices(state_items, merge_spec, parts_meta)
     physical_action_dim = len(action_indices)
     physical_state_dim = len(state_indices)
-    embodiment_stats = stats[embodiment]
+    embodiment_stats = dict(stats[embodiment])
+    if "state" not in embodiment_stats and "proprio" in embodiment_stats:
+        embodiment_stats["state"] = embodiment_stats["proprio"]
     # The published policy is served through model.processor, whose normalization
     # contract can intentionally differ from the dataset's training transforms.
     # Reusing the dataset processor here changes both proprio inputs and decoded
     # actions (LIBERO is q01/q99 at inference, while its dataset config is z-score).
-    default_mode = processor.get("norm_default_mode", "q01/q99")
-    exception_mode = processor.get("norm_exception_mode", {})
-    action_normalization = _normalization_specs(
-        embodiment_stats["action"],
-        action_items,
-        stepwise=bool(processor["use_stepwise_action_norm"]),
-        default_mode=default_mode,
-        exception_modes=exception_mode.get("action", {}),
-    )
-    state_normalization = _normalization_specs(
-        embodiment_stats["state"],
-        state_items,
-        stepwise=False,
-        default_mode=default_mode,
-        exception_modes=exception_mode.get("state", {}),
-    )
+    action_normalization: list[dict[str, Any]] = []
+    state_normalization: list[dict[str, Any]] = []
+    if not use_lerobot_normalization:
+        normalization = _normalization_config(processor, embodiment_processor)
+        if not normalization["use_stepwise_action_norm"]:
+            raise ValueError("post-trained G0.5 checkpoints require stepwise action statistics")
+        action_normalization = _normalization_specs(
+            embodiment_stats["action"],
+            action_items,
+            stepwise=True,
+            default_mode=normalization["default_mode"],
+            exception_modes=normalization["exception_modes"].get("action", {}),
+            section="action",
+        )
+        state_normalization = _normalization_specs(
+            embodiment_stats["state"],
+            state_items,
+            stepwise=False,
+            default_mode=normalization["default_mode"],
+            exception_modes=normalization["exception_modes"].get("state", {}),
+            section="state",
+        )
 
     image_size = tuple(next(iter(processor["camera_size_config"].values())))
-    camera_keys: list[str] = []
-    dummy_camera_keys: list[str] = []
-    camera_order: list[str] = []
-    for index, item in enumerate(image_items):
-        if item.get("dummy", False):
-            key = f"observation.images.g05_dummy_{index}"
-            dummy_camera_keys.append(key)
-        else:
-            key = item["lerobot_key"]
-            camera_keys.append(key)
-        camera_order.append(key)
     output_camera_count = int(processor["num_output_cameras"])
-    while len(camera_order) < output_camera_count:
-        key = f"observation.images.g05_dummy_{len(camera_order)}"
-        dummy_camera_keys.append(key)
-        camera_order.append(key)
-    if len(camera_order) != output_camera_count:
-        raise ValueError("shape metadata contains more cameras than the model processor accepts")
+    semantic_camera_order = {
+        "exterior": "exterior_rgb",
+        "wrist_left": "left_wrist_rgb",
+        "wrist_right": "right_wrist_rgb",
+    }
+    image_by_key = {item["key"]: item for item in image_items}
+    boundary_image_keys = embodiment_processor.get("image_keys")
+    if isinstance(boundary_image_keys, list):
+        missing_boundary_keys = set(boundary_image_keys) - set(image_by_key)
+        if missing_boundary_keys:
+            raise ValueError(
+                f"model-boundary cameras are absent from the shape schema: {sorted(missing_boundary_keys)}"
+            )
+        image_items = [image_by_key[key] for key in boundary_image_keys]
+    else:
+        ordered_keys = [semantic_camera_order.get(name, name) for name in processor["camera_size_config"]]
+        if set(ordered_keys) == set(image_by_key):
+            image_items = [image_by_key[key] for key in ordered_keys]
+    camera_keys, dummy_camera_keys, camera_order = _camera_layout(image_items, output_camera_count)
+    chunk_size = int(architecture["horizon_steps"]) if isinstance(architecture["horizon_steps"], int) else 32
+    n_obs_steps = int(architecture["num_obs_steps"]) if isinstance(architecture["num_obs_steps"], int) else 1
+    image_tokens = (
+        (image_size[0] // int(architecture["vision"]["patch_size"]))
+        * (image_size[1] // int(architecture["vision"]["patch_size"]))
+        // int(architecture["vision"]["spatial_merge_size"]) ** 2
+    )
+    # max_chunk_token_length is a training truncation budget, not an inference
+    # prompt limit. The base checkpoint's 18 image slots alone exceed 1024.
+    max_prompt_length = max(
+        int(architecture["max_chunk_token_length"]),
+        output_camera_count * n_obs_steps * (image_tokens + 2) + 512,
+    )
     vocab_size = int(state["model.vlm.input_proj.weight"].shape[0])
-    action_tokens = _action_tokens({**architecture, "AT_CONFIG": tokenizer_config})
+    action_tokens = action_tokens or _action_tokens({**architecture, "AT_CONFIG": tokenizer_config})
     base_tokenizer_size = vocab_size - len(action_tokens) - 2
     if base_tokenizer_size <= 0:
         raise ValueError("invalid checkpoint vocabulary layout")
@@ -359,16 +613,15 @@ def _build_config(
     config = G05Config(
         input_features=input_features,
         output_features={ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(physical_action_dim,))},
-        chunk_size=(
-            int(architecture["horizon_steps"]) if isinstance(architecture["horizon_steps"], int) else 32
-        ),
+        chunk_size=chunk_size,
         n_action_steps=n_action_steps,
-        n_obs_steps=(
-            int(architecture["num_obs_steps"]) if isinstance(architecture["num_obs_steps"], int) else 1
-        ),
+        n_obs_steps=n_obs_steps,
         image_size=image_size,
         camera_keys=camera_keys,
         dummy_camera_keys=dummy_camera_keys,
+        optional_camera_keys=(
+            [key for key in camera_keys if "wrist" in key] if embodiment in {"so100", "so101"} else []
+        ),
         camera_order=camera_order,
         internal_action_dim=int(architecture["action_dim"]),
         internal_state_dim=int(architecture["proprio_dim"]),
@@ -376,6 +629,7 @@ def _build_config(
         state_indices=state_indices,
         action_normalization=action_normalization,
         state_normalization=state_normalization,
+        normalization_strategy="lerobot" if use_lerobot_normalization else "g05_stepwise",
         relative_action_mask=_relative_action_mask(embodiment_processor, action_items, state_items),
         embodiment=embodiment,
         vocab_size=vocab_size,
@@ -384,7 +638,7 @@ def _build_config(
         image_token_id=int(architecture["image_token_index"]),
         state_token_id=state_token_id,
         eov_token_id=eov_token_id,
-        max_prompt_length=int(architecture["max_chunk_token_length"]),
+        max_prompt_length=max_prompt_length,
         text_hidden_size=int(vlm["hidden_size"]),
         text_intermediate_size=int(vlm["intermediate_size"]),
         text_num_layers=int(vlm["num_hidden_layers"]),
@@ -416,9 +670,24 @@ def _build_config(
         action_token_loss_weight=float(architecture["ar"]["ce_weight"]),
         action_token_start_id=base_tokenizer_size,
         action_token_end_id=base_tokenizer_size + len(action_tokens),
+        max_cot_tokens=int(architecture["ar"].get("max_new_tokens", 300)),
+        max_action_tokens=int(architecture["ar"].get("max_new_tokens", 300)),
         predict_cot=bool(architecture["predict_cot"]),
         discrete_action=bool(architecture["discrete_action"]),
         action_attend_cot=bool(architecture["action_attend_cot"]),
+        attn_implementation=str(architecture.get("attn_implementation", "eager")),
+        action_feature_names=(
+            [
+                "shoulder_pan.pos",
+                "shoulder_lift.pos",
+                "elbow_flex.pos",
+                "wrist_flex.pos",
+                "wrist_roll.pos",
+                "gripper.pos",
+            ]
+            if embodiment in {"so100", "so101"} and physical_action_dim == 6
+            else []
+        ),
         optimizer_lr=optimizer_lr,
         optimizer_betas=tuple(model.get("betas") or (0.9, 0.95)),
         optimizer_weight_decay=float(model.get("weight_decay") or 0.0),
@@ -426,7 +695,6 @@ def _build_config(
         scheduler_warmup_steps=int(model.get("warmup_steps") or 0),
         scheduler_decay_steps=int(model.get("max_steps") or 100_000),
         scheduler_decay_lr=optimizer_lr * float(model.get("lr_min_ratio") or 0.1),
-        source_variant=None,
     )
     return config, action_tokens
 
@@ -444,16 +712,58 @@ def _remap_weights(source: dict[str, Tensor]) -> dict[str, Tensor]:
     return remapped
 
 
+def _dataset_stats_path(metadata_dir: Path) -> Path:
+    canonical = metadata_dir / "dataset_stats.json"
+    if canonical.is_file():
+        return canonical
+    matches = list(metadata_dir.glob("dataset_stats*.json"))
+    if len(matches) != 1:
+        raise FileNotFoundError(f"expected exactly one dataset statistics file under {metadata_dir}")
+    return matches[0]
+
+
+def _action_tokenizer_source(args: argparse.Namespace, variant_dir: Path) -> Path:
+    if args.action_tokenizer_checkpoint is not None:
+        return args.action_tokenizer_checkpoint
+    candidates = [
+        variant_dir / "action_tokenizer_hf",
+        args.legacy_root / "action_tokenizer_hf",
+        args.legacy_root / "action_tokenizer.pt",
+    ]
+    source = next((path for path in candidates if path.is_dir() or path.is_file()), None)
+    if source is None:
+        raise FileNotFoundError("missing G0.5 ActionCodec checkpoint or HF export")
+    return source
+
+
 def convert(args: argparse.Namespace) -> None:
+    defaults = PUBLISHED_VARIANT_DEFAULTS.get(args.variant, {})
+    embodiment = args.embodiment or defaults.get("embodiment")
+    n_action_steps = (
+        args.n_action_steps if args.n_action_steps is not None else defaults.get("n_action_steps")
+    )
+    if n_action_steps is None:
+        raise ValueError("--n-action-steps is required for an unknown checkpoint variant")
     variant_dir = args.legacy_root / args.variant
     metadata_dir = args.metadata_root / args.variant
     hydra = _load_yaml(metadata_dir / ".hydra" / "config.yaml")
-    with (metadata_dir / "dataset_stats.json").open() as stream:
+    with _dataset_stats_path(metadata_dir).open() as stream:
         stats = json.load(stream)
     checkpoint_path = _checkpoint_path(variant_dir)
+    action_tokenizer_source = _action_tokenizer_source(args, variant_dir)
+    tokenizer_config = _action_tokenizer_config(hydra, action_tokenizer_source)
+    exported_action_tokens = _exported_action_tokens(metadata_dir)
     source_state = _model_state(checkpoint_path)
-    config, action_tokens = _build_config(hydra, stats, source_state, args.n_action_steps, args.embodiment)
-    config.source_variant = args.variant
+    config, action_tokens = _build_config(
+        hydra,
+        stats,
+        source_state,
+        n_action_steps,
+        embodiment,
+        use_lerobot_normalization=args.variant == "g05-base",
+        tokenizer_config=tokenizer_config,
+        action_tokens=exported_action_tokens,
+    )
 
     base_tokenizer = AutoTokenizer.from_pretrained(args.processor_dir, local_files_only=True)
     expected_base_size = config.vocab_size - len(action_tokens) - 2
@@ -484,14 +794,8 @@ def convert(args: argparse.Namespace) -> None:
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    tokenizer_config = hydra["model"]["model_arch"]["AT_CONFIG"]
-    if not isinstance(tokenizer_config, dict):
-        tokenizer_config = hydra["tokenizer"]["vq_config"]
-    action_tokenizer_checkpoint = args.action_tokenizer_checkpoint or args.legacy_root / "action_tokenizer.pt"
-    if not action_tokenizer_checkpoint.is_file():
-        raise FileNotFoundError(f"missing G0.5 ActionCodec checkpoint: {action_tokenizer_checkpoint}")
     _save_action_tokenizer(
-        action_tokenizer_checkpoint,
+        action_tokenizer_source,
         tokenizer_config,
         args.output_dir / config.action_tokenizer_subdir,
     )
@@ -522,7 +826,7 @@ def convert(args: argparse.Namespace) -> None:
         "embodiment": config.embodiment,
         "source_sha256": digest.hexdigest(),
         "source_filename": checkpoint_path.name,
-        "action_tokenizer_filename": action_tokenizer_checkpoint.name,
+        "action_tokenizer_filename": action_tokenizer_source.name,
         "self_contained": True,
     }
     (args.output_dir / "conversion.json").write_text(json.dumps(provenance, indent=2) + "\n")
@@ -536,7 +840,11 @@ def main() -> None:
     parser.add_argument("--action-tokenizer-checkpoint", type=Path)
     parser.add_argument("--variant", required=True)
     parser.add_argument("--embodiment")
-    parser.add_argument("--n-action-steps", type=int, required=True)
+    parser.add_argument(
+        "--n-action-steps",
+        type=int,
+        help="actions executed per inference; defaults to the published recommendation",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     convert(parser.parse_args())
 

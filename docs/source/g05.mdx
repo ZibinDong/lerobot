@@ -12,19 +12,33 @@ uv sync --extra g05 --extra training
 
 The converter creates a self-contained directory. It copies the Qwen tokenizer, converts the released ActionCodec into its own Hugging Face `config.json` and `model.safetensors`, embeds normalization and feature-layout metadata in the policy config, and writes the policy tensors as safetensors. The resulting runtime does not access the source G0.5 repository or any external model repository.
 
+`g05-base` uses LeRobot's standard q01/q99 normalizer, so downstream training can replace its dataset statistics normally. Post-trained checkpoints keep their original per-horizon action statistics in a dedicated serialized processor step. The converter accepts the published `q01/q99` and `z-score` modes; `z-score-tail` is intentionally treated as `z-score`.
+
 ```bash
 uv run python -m lerobot.policies.g05.convert_g05_checkpoint \
   --legacy-root /path/to/G05 \
   --metadata-root /path/to/g05-sidecars \
   --processor-dir /path/to/g05-sidecars/qwen3_5_2b_base_processor \
   --variant g05-libero \
-  --n-action-steps 10 \
   --output-dir /path/to/lerobot-g05-libero
 ```
 
 The converter refuses unresolved layouts, vocabulary mismatches, missing weights, unexpected weights, and shape mismatches. Never copy optimizer or scheduler state into the converted artifact.
 
-For checkpoints containing several robot schemas, pass `--embodiment` so the artifact has one explicit physical state/action contract. Continuous flow training/inference and teacher-forced discrete action-token training are supported. SO101 inference additionally requires autoregressive CoT generation and currently fails explicitly instead of returning an incorrectly conditioned action.
+The four published variants have deployment defaults:
+
+| Variant | Default embodiment | Executed action steps |
+| --- | --- | --- |
+| `g05-base` | `galaxea_r1lite` | 16 |
+| `g05-libero` | `libero` | 10 |
+| `g05-droid` | `Droid_Franka` | 16 |
+| `g05-so101` | `so100` | 32 |
+
+Use the same command with another `--variant` to convert it. `--embodiment` overrides the default for multi-embodiment checkpoints (for example, `g05-base --embodiment galaxea_r1pro`), and `--n-action-steps` overrides the execution window.
+
+Continuous flow training/inference and teacher-forced discrete action-token training are supported. The SO101 flow path performs the checkpoint-required greedy CoT generation before action inference. Its LeRobot camera contract uses `observation.images.exterior_rgb` and `observation.images.right_wrist_rgb`; the absent left-wrist slot is generated inside the artifact processor.
+
+G0.5 keeps the original text/action `eager` default, while vision defaults to the original fallback path, `sdpa`. Set `attn_implementation` and `vision_attn_implementation` in `G05Config` to `eager`, `sdpa`, `flash_attention_2`, or `flash_attention_4`. Flash Attention packages are optional local dependencies; the policy never downloads kernels at runtime.
 
 ## Load
 
@@ -40,6 +54,29 @@ preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=p
 ```
 
 Keep `config.json`, policy safetensors, both processor JSON files, their state files, `processor/`, `action_tokenizer/`, and `conversion.json` together. The ActionCodec subdirectory is a standard local Hugging Face model and is required even when a continuous-only policy does not load it at runtime. Moving only the policy weights is unsupported.
+
+## SO100/SO101 deployment
+
+SO100 and SO101 use the same six-axis LeRobot control contract. The converted artifact emits absolute degree targets in this order: `shoulder_pan.pos`, `shoulder_lift.pos`, `elbow_flex.pos`, `wrist_flex.pos`, `wrist_roll.pos`, and `gripper.pos`. Keep `robot.use_degrees=true`; the first five axes use degrees and the gripper uses its calibrated 0–100 range.
+
+The exterior camera is required and must be named `exterior_rgb`. `left_wrist_rgb` and `right_wrist_rgb` are optional; omitted wrist slots become black frames, matching the random camera-drop training pipeline. A two-camera rollout can be started with:
+
+```bash
+uv run lerobot-rollout \
+  --strategy.type=base \
+  --policy.path=/path/to/lerobot-g05-so101 \
+  --robot.type=so101_follower \
+  --robot.port=/dev/ttyACM0 \
+  --robot.use_degrees=true \
+  --robot.max_relative_target=5 \
+  --robot.cameras="{ exterior_rgb: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, right_wrist_rgb: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}}" \
+  --task="pick up the object" \
+  --fps=30 \
+  --duration=60 \
+  --device=cuda
+```
+
+Use `--robot.type=so100_follower` unchanged for SO100. `max_relative_target` is a controller-side safety limit on the change between the current and commanded absolute target; tune it conservatively for the physical setup.
 
 ## Published checkpoint defaults
 

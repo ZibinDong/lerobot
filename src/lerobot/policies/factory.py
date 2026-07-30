@@ -179,6 +179,7 @@ def make_pre_post_processors(
                 config=policy_cfg,
                 pretrained_path=pretrained_path,
                 revision=pretrained_revision,
+                dataset_stats=kwargs.get("dataset_stats"),
                 preprocessor_config_filename=kwargs.get(
                     "preprocessor_config_filename", f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
                 ),

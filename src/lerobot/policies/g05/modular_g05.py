@@ -15,7 +15,6 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
-from einops import rearrange
 from torch import Tensor, nn
 from torch.nn import functional
 
@@ -25,124 +24,42 @@ from .configuration_g05 import G05Config
 
 if TYPE_CHECKING or _transformers_available:
     from transformers import DynamicCache
-    from transformers.modeling_outputs import BaseModelOutputWithPooling
-    from transformers.models.qwen3_5.configuration_qwen3_5 import (
-        Qwen3_5TextConfig,
-        Qwen3_5VisionConfig,
-    )
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import (
         Qwen3_5Attention,
         Qwen3_5GatedDeltaNet,
         Qwen3_5MLP,
         Qwen3_5TextRotaryEmbedding,
-        Qwen3_5VisionModel,
+        Qwen3_5VisionPatchEmbed,
+        Qwen3_5VisionPatchMerger,
     )
 
 
-G05_INPUT_IDS = "g05_input_ids"
-G05_ATTENTION_MASK = "g05_attention_mask"
-G05_IMAGES = "g05_images"
-G05_ACTION_PAD_MASK = "g05_action_pad_mask"
-G05_ACTION_DIM_PAD_MASK = "g05_action_dim_pad_mask"
-G05_ACTION_TOKEN_IDS = "g05_action_token_ids"
-G05_LABELS = "g05_labels"
-G05_PREFIX_LENGTH = "g05_prefix_length"
+class G05VisionPatchEmbed(Qwen3_5VisionPatchEmbed):
+    """Qwen patch projection with the fp32 boundary used by G0.5."""
 
-
-def rotate_half(values: Tensor) -> Tensor:
-    """Rotate pairs used by RoPE without changing their storage order."""
-    first, second = values.chunk(2, dim=-1)
-    return torch.cat((-second, first), dim=-1)
-
-
-class G05VisionAttention(nn.Module):
-    """Qwen3.5 vision attention for a packed batch of equal-sized G0.5 images."""
-
-    def __init__(self, config: Qwen3_5VisionConfig) -> None:
-        super().__init__()
-        self.num_heads = config.num_heads
-        self.head_dim = config.hidden_size // config.num_heads
-        self.scaling = self.head_dim**-0.5
-        self.qkv = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=True)
-        self.proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        cu_seqlens: Tensor,
-        position_embeddings: tuple[Tensor, Tensor],
-        **kwargs,
-    ) -> Tensor:
-        del kwargs
-        num_images = cu_seqlens.numel() - 1
-        if hidden_states.shape[0] % num_images:
-            raise ValueError("G0.5 vision attention requires equal token counts for every image")
-
-        # The released checkpoint applies vision RoPE in fp32, then restores
-        # the projection dtype before attention.
-        query, key, value = rearrange(
-            self.qkv(hidden_states),
-            "(images tokens) (qkv heads dim) -> qkv images heads tokens dim",
-            images=num_images,
-            qkv=3,
-            heads=self.num_heads,
-        ).unbind(0)
-        cos, sin = position_embeddings
-        cos = rearrange(cos.float(), "(images tokens) dim -> images 1 tokens dim", images=num_images)
-        sin = rearrange(sin.float(), "(images tokens) dim -> images 1 tokens dim", images=num_images)
-        query_fp32 = query.float()
-        key_fp32 = key.float()
-        query = (query_fp32 * cos + rotate_half(query_fp32) * sin).to(query.dtype)
-        key = (key_fp32 * cos + rotate_half(key_fp32) * sin).to(key.dtype)
-
-        attended = functional.scaled_dot_product_attention(query, key, value, scale=self.scaling)
-        attended = rearrange(attended, "images heads tokens dim -> (images tokens) (heads dim)")
-        return self.proj(attended)
-
-
-class G05VisionModel(Qwen3_5VisionModel):
-    """Published G0.5 vision tower with packed multi-image attention semantics."""
-
-    def __init__(self, config: Qwen3_5VisionConfig) -> None:
-        super().__init__(config)
-        for block in self.blocks:
-            block.attn = G05VisionAttention(config)
-
-    def forward(self, hidden_states: Tensor, grid_thw: Tensor, **kwargs) -> BaseModelOutputWithPooling:
-        del kwargs
-        # Patch projection and learned position interpolation are explicitly
-        # fp32 in the official model, including under outer autocast.
+    def forward(self, hidden_states: Tensor) -> Tensor:
         with torch.autocast(hidden_states.device.type, enabled=False):
-            hidden_states = self.patch_embed(hidden_states)
-            hidden_states = hidden_states + self.fast_pos_embed_interpolate(grid_thw)
+            return super().forward(hidden_states.float())
 
-        rotary = self.rot_pos_emb(grid_thw)
-        rotary = torch.cat((rotary, rotary), dim=-1)
-        position_embeddings = (rotary.cos(), rotary.sin())
-        image_lengths = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])
-        cu_seqlens = functional.pad(image_lengths.cumsum(0, dtype=torch.int32), (1, 0))
 
-        # Transformer blocks remain sequential by construction; attention inside
-        # each block is batched across all cameras and timesteps.
-        for block in self.blocks:
-            hidden_states = block(
-                hidden_states,
-                cu_seqlens=cu_seqlens,
-                position_embeddings=position_embeddings,
-            )
-        # PatchMerger is a learned projection into the language hidden size.
-        # The source model keeps this complete projection in fp32; allowing the
-        # outer policy autocast to round it changes every image prefix token.
+class G05VisionPatchMerger(Qwen3_5VisionPatchMerger):
+    """Qwen patch merger with the fp32 boundary used by G0.5."""
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
         with torch.autocast(hidden_states.device.type, enabled=False):
-            pooled = self.merger(hidden_states)
-        return BaseModelOutputWithPooling(
-            last_hidden_state=hidden_states,
-            pooler_output=pooled,
-        )
+            return super().forward(hidden_states.float())
 
 
 class G05GatedDeltaNet(Qwen3_5GatedDeltaNet):
-    """Qwen3.5 linear attention with the released G0.5 numerical semantics."""
+    """Qwen linear attention extended for a cached multi-token suffix.
+
+    Transformers handles an uncached prefill and cached one-token decoding, but
+    G0.5 also teacher-forces an entire action-token suffix onto an existing VLM
+    prefix cache. That path must continue both the causal-convolution and gated
+    recurrent states from the prefix. The explicit fp32 decay and gated norm,
+    plus chunk size 32, preserve the released checkpoint's numerical behavior.
+    """
 
     def forward(
         self,
@@ -259,95 +176,6 @@ class G05GatedDeltaNet(Qwen3_5GatedDeltaNet):
         return self.out_proj(attended)
 
 
-class G05Attention(Qwen3_5Attention):
-    """Full attention with G0.5's explicit RoPE and eager-attention precision."""
-
-    def __init__(self, config: Qwen3_5TextConfig, layer_index: int) -> None:
-        super().__init__(config, layer_index)
-        self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
-
-    def forward(
-        self,
-        hidden_states: Tensor,
-        position_embeddings: tuple[Tensor, Tensor],
-        attention_mask: Tensor | None,
-        past_key_values: DynamicCache | None = None,
-        **kwargs,
-    ) -> tuple[Tensor, None]:
-        del kwargs
-        batch_size, sequence_length, _ = hidden_states.shape
-        projected = self.q_proj(hidden_states)
-        query, gate = rearrange(
-            projected,
-            "batch tokens (heads pair dim) -> pair batch heads tokens dim",
-            heads=self.num_heads,
-            pair=2,
-            dim=self.head_dim,
-        ).unbind(0)
-        gate = rearrange(gate, "batch heads tokens dim -> batch tokens (heads dim)")
-        query = self.q_norm(rearrange(query, "batch heads tokens dim -> batch tokens heads dim"))
-        query = rearrange(query, "batch tokens heads dim -> batch heads tokens dim")
-
-        key = rearrange(
-            self.k_proj(hidden_states),
-            "batch tokens (heads dim) -> batch tokens heads dim",
-            heads=self.num_key_value_heads,
-            dim=self.head_dim,
-        )
-        key = rearrange(self.k_norm(key), "batch tokens heads dim -> batch heads tokens dim")
-        value = rearrange(
-            self.v_proj(hidden_states),
-            "batch tokens (heads dim) -> batch heads tokens dim",
-            heads=self.num_key_value_heads,
-            dim=self.head_dim,
-        )
-
-        # The checkpoint was trained with RoPE evaluated in fp32 and rounded
-        # back to the Q/K projection dtype before the attention matmuls.
-        cos, sin = position_embeddings
-        with torch.autocast(hidden_states.device.type, enabled=False):
-            query_dtype = query.dtype
-            rotary_size = cos.shape[-1]
-            query_rotary, query_pass = query.float().split((rotary_size, self.head_dim - rotary_size), dim=-1)
-            key_rotary, key_pass = key.float().split((rotary_size, self.head_dim - rotary_size), dim=-1)
-            cos = cos[:, None].float()
-            sin = sin[:, None].float()
-            query = torch.cat((query_rotary * cos + rotate_half(query_rotary) * sin, query_pass), dim=-1).to(
-                query_dtype
-            )
-            key = torch.cat((key_rotary * cos + rotate_half(key_rotary) * sin, key_pass), dim=-1).to(
-                query_dtype
-            )
-
-        if past_key_values is not None:
-            key, value = past_key_values.update(key, value, self.layer_idx)
-
-        repeats = self.num_heads // self.num_key_value_heads
-        if repeats > 1:
-            key = (
-                key[:, :, None]
-                .expand(-1, -1, repeats, -1, -1)
-                .reshape(batch_size, self.num_heads, -1, self.head_dim)
-            )
-            value = (
-                value[:, :, None]
-                .expand(-1, -1, repeats, -1, -1)
-                .reshape(batch_size, self.num_heads, -1, self.head_dim)
-            )
-
-        # Keep the operation order of the source eager implementation. SDPA is
-        # not interchangeable here because its bf16 reduction differs.
-        attention = torch.matmul(query, key.transpose(-1, -2)) * self.scaling
-        if attention_mask is not None:
-            attention = attention + attention_mask
-        attention = functional.softmax(attention, dim=-1, dtype=torch.float32).to(query.dtype)
-        attended = torch.matmul(attention, value)
-        attended = rearrange(attended, "batch heads tokens dim -> batch tokens (heads dim)")
-        attended = attended * gate.sigmoid()
-        return self.o_proj(attended), None
-
-
 class SinusoidalTimeEmbedding(nn.Module):
     """Fixed flow-time features used by the action expert."""
 
@@ -396,7 +224,10 @@ class ActionExpertLayer(nn.Module):
 
     def __init__(self, config: Qwen3_5TextConfig, layer_index: int) -> None:
         super().__init__()
-        self.self_attn = G05Attention(config, layer_index)
+        self.self_attn = Qwen3_5Attention(config, layer_index)
+        # Action suffix tokens are bidirectional; prefix visibility is carried
+        # by the explicit mask rather than decoder causality.
+        self.self_attn.is_causal = False
         self.mlp = Qwen3_5MLP(config, intermediate_size=config.intermediate_size)
         self.input_layernorm = AdaptiveRMSNorm(config.hidden_size, config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = AdaptiveRMSNorm(
@@ -408,7 +239,7 @@ class ActionExpertLayer(nn.Module):
         hidden_states: Tensor,
         time_condition: Tensor,
         position_embeddings: tuple[Tensor, Tensor],
-        attention_mask: Tensor,
+        attention_mask: Tensor | None,
         cache: DynamicCache,
     ) -> Tensor:
         residual = hidden_states
@@ -451,7 +282,7 @@ class ActionExpert(nn.Module):
             attention_bias=False,
             rms_norm_eps=1e-6,
         )
-        expert_config._attn_implementation = "eager"
+        expert_config._attn_implementation = config.attn_implementation
         self.config = expert_config
         self.input_proj = nn.Linear(config.internal_action_dim, config.expert_hidden_size)
         self.output_proj = nn.Linear(config.expert_hidden_size, config.internal_action_dim)
@@ -504,13 +335,29 @@ class ActionExpert(nn.Module):
         position_embeddings = self.rotary_emb(hidden_states, action_offsets + action_positions)
         cache = self.copy_prefix_cache(prefix_cache)
 
-        # Action tokens are bidirectional. Only the expert layers paired with a
-        # full-attention VLM layer have prefix KV, so two masks cover every layer.
-        action_mask = hidden_states.new_zeros(batch_size, 1, action_length, action_length)
-        prefix_mask = (~prefix_attention_mask).to(hidden_states.dtype)
-        prefix_mask = prefix_mask * torch.finfo(hidden_states.dtype).min
-        prefix_mask = prefix_mask[:, None, None, :].expand(-1, 1, action_length, -1)
-        mask_with_prefix = torch.cat((prefix_mask, action_mask), dim=-1)
+        # Flash Attention consumes a 2-D valid-token mask, while eager and SDPA
+        # consume the equivalent additive mask. Both describe non-causal action
+        # suffixes attending to every valid prefix key.
+        if self.config._attn_implementation.startswith("flash_attention"):
+            action_mask = None
+            mask_with_prefix = torch.cat(
+                (
+                    prefix_attention_mask,
+                    torch.ones(
+                        batch_size,
+                        action_length,
+                        dtype=torch.bool,
+                        device=actions.device,
+                    ),
+                ),
+                dim=-1,
+            )
+        else:
+            action_mask = hidden_states.new_zeros(batch_size, 1, action_length, action_length)
+            prefix_mask = (~prefix_attention_mask).to(hidden_states.dtype)
+            prefix_mask = prefix_mask * torch.finfo(hidden_states.dtype).min
+            prefix_mask = prefix_mask[:, None, None, :].expand(-1, 1, action_length, -1)
+            mask_with_prefix = torch.cat((prefix_mask, action_mask), dim=-1)
 
         for index, layer in enumerate(self.layers):
             attention_mask = mask_with_prefix if cache.layers[index].is_initialized else action_mask

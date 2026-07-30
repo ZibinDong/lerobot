@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 from collections import deque
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,22 +16,21 @@ from einops import rearrange, repeat
 from torch import Tensor, nn
 
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION,
+    ACTION_TOKENS,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+)
 from lerobot.utils.import_utils import _transformers_available
 
 from .configuration_g05 import G05Config
 from .modular_g05 import (
-    G05_ACTION_DIM_PAD_MASK,
-    G05_ACTION_PAD_MASK,
-    G05_ATTENTION_MASK,
-    G05_IMAGES,
-    G05_INPUT_IDS,
-    G05_LABELS,
-    G05_PREFIX_LENGTH,
     ActionExpert,
-    G05Attention,
     G05GatedDeltaNet,
-    G05VisionModel,
+    G05VisionPatchEmbed,
+    G05VisionPatchMerger,
 )
 
 if TYPE_CHECKING or _transformers_available:
@@ -39,7 +39,7 @@ if TYPE_CHECKING or _transformers_available:
         Qwen3_5TextConfig,
         Qwen3_5VisionConfig,
     )
-    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel, Qwen3_5VisionModel
 
 
 class G05Model(nn.Module):
@@ -47,6 +47,14 @@ class G05Model(nn.Module):
 
     def __init__(self, config: G05Config) -> None:
         super().__init__()
+        from transformers import utils as transformers_utils
+
+        for backend in {config.attn_implementation, config.vision_attn_implementation}:
+            if backend.startswith("flash_attention"):
+                version = backend.rsplit("_", 1)[-1]
+                available = getattr(transformers_utils, f"is_flash_attn_{version}_available")()
+                if not available:
+                    raise ImportError(f"{backend} was selected but its local package is unavailable")
         text_config = Qwen3_5TextConfig(
             vocab_size=config.vocab_size,
             hidden_size=config.text_hidden_size,
@@ -82,12 +90,15 @@ class G05Model(nn.Module):
             spatial_merge_size=config.vision_spatial_merge_size,
             out_hidden_size=config.text_hidden_size,
         )
-        # G0.5 full-attention layers use the explicit eager causal mask. This
-        # must be selected before TextModel builds its mask interface; SDPA may
-        # otherwise elide the mask and rely on an internal ``is_causal`` flag.
-        text_config._attn_implementation = "eager"
+        text_config._attn_implementation = config.attn_implementation
+        vision_config._attn_implementation = config.vision_attn_implementation
         self.config = config
-        self.vision_tower = G05VisionModel(vision_config)
+        self.vision_tower = Qwen3_5VisionModel(vision_config)
+        # The released checkpoint keeps only patch projection and merger in
+        # fp32. Tiny forward overrides preserve those autocast boundaries while
+        # the complete vision tower remains the native Transformers model.
+        self.vision_tower.patch_embed = G05VisionPatchEmbed(vision_config)
+        self.vision_tower.merger = G05VisionPatchMerger(vision_config, use_postshuffle_norm=False)
         self.vlm = Qwen3_5TextModel(text_config)
         # Transformers' generic Qwen3.5 linear attention uses different chunk
         # and precision defaults. Replace only those layers while retaining the
@@ -95,8 +106,6 @@ class G05Model(nn.Module):
         for index, layer in enumerate(self.vlm.layers):
             if layer.layer_type == "linear_attention":
                 layer.linear_attn = G05GatedDeltaNet(text_config, index)
-            else:
-                layer.self_attn = G05Attention(text_config, index)
         self.output_proj = nn.Linear(config.text_hidden_size, config.vocab_size, bias=False)
         self.output_proj.weight = self.vlm.embed_tokens.weight
         self.proprio_embedder = nn.Sequential(
@@ -106,6 +115,11 @@ class G05Model(nn.Module):
             nn.Linear(config.text_hidden_size, config.text_hidden_size),
         )
         self.action_expert = ActionExpert(config)
+        action_dimension_is_pad = torch.ones(config.internal_action_dim, dtype=torch.bool)
+        physical_action_dim = config.output_features[ACTION].shape[-1]
+        action_indices = config.action_indices or list(range(physical_action_dim))
+        action_dimension_is_pad[action_indices] = False
+        self.register_buffer("action_dimension_is_pad", action_dimension_is_pad, persistent=False)
 
     def encode_images(self, images: Tensor) -> Tensor:
         """Patchify all cameras/timesteps and encode them as one packed vision batch.
@@ -201,11 +215,11 @@ class G05Model(nn.Module):
 
     def vlm_forward(self, batch: dict[str, Tensor], *, use_cache: bool):
         """Run the multimodal language model for either prefix caching or AR loss."""
-        input_ids = batch[G05_INPUT_IDS]
-        attention_mask = batch[G05_ATTENTION_MASK].bool()
+        input_ids = batch[OBS_LANGUAGE_TOKENS]
+        attention_mask = batch[OBS_LANGUAGE_ATTENTION_MASK].bool()
         inputs_embeds = self.vlm.embed_tokens(input_ids)
 
-        image_features = self.encode_images(batch[G05_IMAGES]).to(inputs_embeds.dtype)
+        image_features = self.encode_images(batch["pixel_values"]).to(inputs_embeds.dtype)
         image_mask = input_ids.eq(self.config.image_token_id)
         inputs_embeds = inputs_embeds.masked_scatter(image_mask.unsqueeze(-1), image_features)
 
@@ -230,14 +244,8 @@ class G05Model(nn.Module):
         return outputs, position_ids, attention_mask
 
     def prefill(self, batch: dict[str, Tensor]) -> tuple[DynamicCache, Tensor, Tensor, Tensor]:
-        """Encode only the prefix, excluding teacher-forced action tokens."""
-        prefix_length = int(batch.get(G05_PREFIX_LENGTH, batch[G05_INPUT_IDS].shape[1]))
-        prefix_batch = {
-            **batch,
-            G05_INPUT_IDS: batch[G05_INPUT_IDS][:, :prefix_length],
-            G05_ATTENTION_MASK: batch[G05_ATTENTION_MASK][:, :prefix_length],
-        }
-        outputs, position_ids, attention_mask = self.vlm_forward(prefix_batch, use_cache=True)
+        """Encode the multimodal prefix once for flow and token objectives."""
+        outputs, position_ids, attention_mask = self.vlm_forward(batch, use_cache=True)
         return outputs.past_key_values, position_ids, attention_mask, outputs.last_hidden_state[:, -1:]
 
     def copy_vlm_cache(self, source: DynamicCache) -> DynamicCache:
@@ -251,24 +259,158 @@ class G05Model(nn.Module):
             destination.layers[index] = destination_layer
         return destination
 
+    def generate_cot(
+        self,
+        batch: dict[str, Tensor],
+        prefix: tuple[DynamicCache, Tensor, Tensor, Tensor],
+    ) -> tuple[DynamicCache, Tensor, Tensor, Tensor]:
+        """Greedily extend the VLM prefix until every sample emits EOV or EOS.
+
+        The released SO101 checkpoint conditions its flow expert on this generated
+        context. Stop tokens are returned by the language head but are not committed
+        to the cache, matching the source inference pipeline. Rows that finish early
+        receive masked cache slots while other rows continue; their recurrent linear
+        attention state is restored after each padded forward.
+        """
+        cache, position_ids, attention_mask, last_hidden = prefix
+        input_ids = batch[OBS_LANGUAGE_TOKENS]
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        stop_ids = {self.config.eos_token_id}
+        if self.config.eov_token_id is not None:
+            stop_ids.add(self.config.eov_token_id)
+
+        for _ in range(self.config.max_cot_tokens):
+            next_token = self.output_proj(last_hidden[:, -1]).argmax(dim=-1)
+            is_stop = torch.zeros_like(finished)
+            for token_id in stop_ids:
+                is_stop |= next_token.eq(token_id)
+            finished |= is_stop
+            if bool(finished.all()):
+                break
+
+            # Stop tokens are not part of the action-conditioning prefix. Finished
+            # rows use a masked pad slot so batched cache lengths remain rectangular.
+            input_token = next_token.masked_fill(finished, self.config.pad_token_id).unsqueeze(1)
+            input_ids = torch.cat((input_ids, input_token), dim=1)
+            attention_mask = torch.cat((attention_mask, (~finished).unsqueeze(1)), dim=1)
+            position_ids = self.build_mrope_position_ids(input_ids, attention_mask)
+
+            frozen_linear_states = []
+            for layer in cache.layers:
+                if hasattr(layer, "keys"):
+                    continue
+                frozen_linear_states.append(
+                    (
+                        layer,
+                        layer.conv_states[finished].clone(),
+                        layer.recurrent_states[finished].clone(),
+                    )
+                )
+
+            outputs = self.vlm(
+                inputs_embeds=self.vlm.embed_tokens(input_token),
+                attention_mask=attention_mask,
+                position_ids=position_ids[..., -1:],
+                past_key_values=cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            cache = outputs.past_key_values
+            for layer, conv_states, recurrent_states in frozen_linear_states:
+                layer.conv_states[finished] = conv_states
+                layer.recurrent_states[finished] = recurrent_states
+            last_hidden = torch.where(
+                finished[:, None, None],
+                last_hidden,
+                outputs.last_hidden_state,
+            )
+        return cache, position_ids, attention_mask, last_hidden
+
+    @torch.no_grad()
+    def sample_action_tokens(self, batch: dict[str, Tensor]) -> list[Tensor]:
+        """Greedily generate one serialized ActionCodec sequence per observation.
+
+        This path only runs the vision/VLM prefix and language head. It never calls
+        the flow-matching action expert, allowing AR and FM deployment costs to be
+        measured independently.
+        """
+        cache, _, attention_mask, last_hidden = self.prefill(batch)
+        input_ids = batch[OBS_LANGUAGE_TOKENS]
+        start = self.config.action_token_start_id
+        end = self.config.action_token_end_id
+        if start is None or end is None:
+            raise ValueError("AR inference requires the converted action-token range")
+
+        batch_size = input_ids.shape[0]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        generated: list[list[Tensor]] = [[] for _ in range(batch_size)]
+        full_ids = input_ids
+
+        for _ in range(self.config.max_action_tokens):
+            next_token = self.output_proj(last_hidden[:, -1]).argmax(dim=-1)
+            is_action = next_token.ge(start) & next_token.lt(end)
+            live_action = (~finished) & is_action
+            for batch_index in live_action.nonzero(as_tuple=False).flatten().tolist():
+                generated[batch_index].append(next_token[batch_index])
+
+            # The training suffix terminates with EOS. Treating any other token
+            # outside the ActionCodec vocabulary as terminal matches the source
+            # decoder's behavior for an absent or malformed action segment.
+            finished |= ~is_action
+            if bool(finished.all()):
+                break
+
+            input_token = next_token.masked_fill(finished, self.config.pad_token_id).unsqueeze(1)
+            full_ids = torch.cat((full_ids, input_token), dim=1)
+            attention_mask = torch.cat((attention_mask, (~finished).unsqueeze(1)), dim=1)
+            position_ids = self.build_mrope_position_ids(full_ids, attention_mask)
+
+            frozen_linear_states = []
+            for layer in cache.layers:
+                if hasattr(layer, "keys"):
+                    continue
+                frozen_linear_states.append(
+                    (
+                        layer,
+                        layer.conv_states[finished].clone(),
+                        layer.recurrent_states[finished].clone(),
+                    )
+                )
+            outputs = self.vlm(
+                inputs_embeds=self.vlm.embed_tokens(input_token),
+                attention_mask=attention_mask,
+                position_ids=position_ids[..., -1:],
+                past_key_values=cache,
+                use_cache=True,
+                return_dict=True,
+            )
+            cache = outputs.past_key_values
+            for layer, conv_states, recurrent_states in frozen_linear_states:
+                layer.conv_states[finished] = conv_states
+                layer.recurrent_states[finished] = recurrent_states
+            last_hidden = torch.where(finished[:, None, None], last_hidden, outputs.last_hidden_state)
+
+        return [torch.stack(row) if row else input_ids.new_empty(0) for row in generated]
+
     def autoregressive_loss(
         self,
         batch: dict[str, Tensor],
         prefill: tuple[DynamicCache, Tensor, Tensor, Tensor],
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Compute shifted CE and action/CoT accuracies over labeled suffix tokens."""
-        if G05_LABELS not in batch:
-            raise ValueError("discrete G0.5 training requires action-token labels from the processor")
+        if ACTION_TOKENS not in batch:
+            raise ValueError("discrete G0.5 training requires action.tokens from the processor")
         prefix_cache, _, _, prefix_last_hidden = prefill
         suffix_cache = self.copy_vlm_cache(prefix_cache)
-        prefix_length = int(batch[G05_PREFIX_LENGTH])
-        suffix_ids = batch[G05_INPUT_IDS][:, prefix_length:]
-        suffix_positions = self.build_mrope_position_ids(
-            batch[G05_INPUT_IDS], batch[G05_ATTENTION_MASK].bool()
-        )[:, :, prefix_length:]
+        prefix_ids = batch[OBS_LANGUAGE_TOKENS]
+        prefix_mask = batch[OBS_LANGUAGE_ATTENTION_MASK].bool()
+        suffix_ids = batch[ACTION_TOKENS]
+        full_ids = torch.cat((prefix_ids, suffix_ids), dim=-1)
+        full_mask = torch.cat((prefix_mask, torch.ones_like(suffix_ids, dtype=torch.bool)), dim=-1)
+        suffix_positions = self.build_mrope_position_ids(full_ids, full_mask)[:, :, prefix_ids.shape[-1] :]
         outputs = self.vlm(
             inputs_embeds=self.vlm.embed_tokens(suffix_ids),
-            attention_mask=batch[G05_ATTENTION_MASK].bool(),
+            attention_mask=full_mask,
             position_ids=suffix_positions,
             past_key_values=suffix_cache,
             use_cache=False,
@@ -277,7 +419,7 @@ class G05Model(nn.Module):
         # The final prefix state predicts the first action token; each suffix
         # state then predicts the following action token or EOS.
         hidden_states = torch.cat((prefix_last_hidden, outputs.last_hidden_state[:, :-1]), dim=1)
-        labels = batch[G05_LABELS][:, prefix_length:]
+        labels = suffix_ids
         valid = labels.ne(-100)
         if not valid.any():
             zero = hidden_states.sum() * 0
@@ -362,38 +504,35 @@ class G05Model(nn.Module):
         )
         squared_error = (velocity - (noise - actions)).square()
         weights = torch.ones_like(squared_error)
-        if G05_ACTION_PAD_MASK in batch:
+        if "action_is_pad" in batch:
             action_pad_mask = repeat(
-                batch[G05_ACTION_PAD_MASK],
+                batch["action_is_pad"],
                 "batch horizon -> (samples batch) horizon",
                 samples=num_samples,
             )
             weights.masked_fill_(action_pad_mask[..., None], 0)
-        if G05_ACTION_DIM_PAD_MASK in batch:
-            dimension_pad_mask = repeat(
-                batch[G05_ACTION_DIM_PAD_MASK],
-                "batch dim -> (samples batch) dim",
-                samples=num_samples,
-            )
-            weights.masked_fill_(dimension_pad_mask[:, None, :], 0)
+        weights.masked_fill_(self.action_dimension_is_pad[None, None, :], 0)
         return (weights * squared_error).sum() / weights.sum().clamp_min(1)
 
     @torch.no_grad()
     def sample_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Integrate the learned velocity field from Gaussian noise to actions."""
-        prefix_cache, prefix_position_ids, prefix_attention_mask, _ = self.prefill(batch)
-        batch_size = batch[G05_INPUT_IDS].shape[0]
+        prefix = self.prefill(batch)
+        if self.config.action_attend_cot:
+            prefix = self.generate_cot(batch, prefix)
+        prefix_cache, prefix_position_ids, prefix_attention_mask, _ = prefix
+        input_ids = batch[OBS_LANGUAGE_TOKENS]
+        batch_size = input_ids.shape[0]
         if noise is None:
             noise = torch.randn(
                 batch_size,
                 self.config.chunk_size,
                 self.config.internal_action_dim,
-                device=batch[G05_INPUT_IDS].device,
+                device=input_ids.device,
                 dtype=batch[OBS_STATE].dtype,
             )
-        dimension_pad_mask = batch.get(G05_ACTION_DIM_PAD_MASK)
-        if dimension_pad_mask is not None:
-            noise = noise.masked_fill(dimension_pad_mask[:, None, :], 0)
+        dimension_pad_mask = self.action_dimension_is_pad[None, None, :]
+        noise = noise.masked_fill(dimension_pad_mask, 0)
         actions = noise
         step_size = 1 / self.config.num_inference_steps
         time = torch.ones(batch_size, device=actions.device, dtype=actions.dtype)
@@ -406,8 +545,7 @@ class G05Model(nn.Module):
                 prefix_attention_mask,
             )
             actions = actions - step_size * velocity
-            if dimension_pad_mask is not None:
-                actions.masked_fill_(dimension_pad_mask[:, None, :], 0)
+            actions.masked_fill_(dimension_pad_mask, 0)
             time = time - step_size
         return actions
 
@@ -426,6 +564,43 @@ class G05Policy(PreTrainedPolicy):
         self.model = G05Model(config)
         self._action_queue: deque[Tensor] = deque(maxlen=config.n_action_steps)
         self._physical_action_dim = config.output_features[ACTION].shape[-1]
+        self._action_tokenizer = None
+
+    @classmethod
+    def from_pretrained(cls, pretrained_name_or_path: str | Path, **kwargs) -> G05Policy:
+        policy = super().from_pretrained(pretrained_name_or_path, **kwargs)
+        if policy.config.inference_action_head != "ar":
+            return policy
+
+        artifact_root = Path(pretrained_name_or_path)
+        if not artifact_root.is_dir():
+            from huggingface_hub import snapshot_download
+
+            artifact_root = Path(
+                snapshot_download(
+                    str(pretrained_name_or_path),
+                    revision=kwargs.get("revision"),
+                    local_files_only=kwargs.get("local_files_only", False),
+                    allow_patterns=[
+                        f"{policy.config.tokenizer_subdir}/*",
+                        f"{policy.config.action_tokenizer_subdir}/*",
+                    ],
+                )
+            )
+        from transformers import AutoTokenizer
+
+        from .action_tokenizer import G05ActionCodecModel, G05ActionTokenizer
+
+        text_tokenizer = AutoTokenizer.from_pretrained(
+            artifact_root / policy.config.tokenizer_subdir,
+            local_files_only=True,
+        )
+        codec = G05ActionCodecModel.from_pretrained(
+            artifact_root / policy.config.action_tokenizer_subdir,
+            local_files_only=True,
+        ).to(next(policy.parameters()).device)
+        policy._action_tokenizer = G05ActionTokenizer(codec, text_tokenizer)
+        return policy
 
     def reset(self) -> None:
         self._action_queue.clear()
@@ -435,7 +610,7 @@ class G05Policy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, Tensor]]:
         """Return the configured continuous-flow and discrete-token objectives."""
-        device_type = batch[G05_INPUT_IDS].device.type
+        device_type = batch[OBS_LANGUAGE_TOKENS].device.type
         with torch.autocast(
             device_type,
             dtype=torch.bfloat16,
@@ -460,18 +635,29 @@ class G05Policy(PreTrainedPolicy):
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
-        """Predict a physical action chunk, removing checkpoint-only padded dimensions."""
-        if self.config.action_attend_cot:
-            raise NotImplementedError(
-                "this checkpoint requires autoregressive CoT generation before flow inference"
-            )
-        device_type = batch[G05_INPUT_IDS].device.type
+        """Predict a physical action chunk with exactly one configured inference head."""
+        device_type = batch[OBS_LANGUAGE_TOKENS].device.type
         with torch.autocast(
             device_type,
             dtype=torch.bfloat16,
             enabled=self.config.dtype == "bfloat16" and device_type == "cuda",
         ):
-            actions = self.model.sample_actions(batch, noise=noise)
+            if self.config.inference_action_head == "fm":
+                actions = self.model.sample_actions(batch, noise=noise)
+            else:
+                if self._action_tokenizer is None:
+                    raise RuntimeError("AR inference requires the artifact's ActionCodec tokenizer")
+                token_rows = self.model.sample_action_tokens(batch)
+                decoded_rows = []
+                for row in token_rows:
+                    if row.numel() == 0:
+                        decoded = batch[OBS_STATE].new_zeros(
+                            self.config.chunk_size, self.config.internal_action_dim
+                        )
+                    else:
+                        decoded = self._action_tokenizer.decode(row.unsqueeze(0))[0]
+                    decoded_rows.append(decoded)
+                actions = torch.stack(decoded_rows)
         indices = self.config.action_indices or list(range(self._physical_action_dim))
         return actions[..., indices]
 

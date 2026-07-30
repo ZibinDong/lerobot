@@ -22,29 +22,77 @@ class G05Config(PreTrainedConfig):
 
     Values that vary between published checkpoints are stored in the converted
     artifact. Runtime code never infers an embodiment from a checkpoint name.
+
+    Args:
+        chunk_size: Number of future actions predicted by one model forward. It
+            is part of the trained action-expert shape and dataset sampling.
+        n_action_steps: Number of predicted actions consumed by ``select_action``
+            before the policy runs the model again. This is an inference policy
+            setting, not a neural-network dimension; it stays here because
+            LeRobot policies own their action queues and eval calls one action at
+            a time. It may be overridden without changing model weights.
+        n_obs_steps: Number of observation frames supplied for each camera.
+        camera_keys: Real LeRobot image feature keys expected by the checkpoint.
+        dummy_camera_keys: Camera slots always filled with zero images.
+        optional_camera_keys: Real camera slots filled with zero images when the
+            hardware does not provide them.
+        camera_order: Checkpoint camera order, including real and dummy cameras.
+        internal_action_dim: Checkpoint action width before removing padded or
+            embodiment-specific dimensions.
+        internal_state_dim: Checkpoint state width after processor-side padding.
+        action_indices: Mapping from physical action dimensions into checkpoint
+            dimensions; empty means the leading dimensions.
+        state_indices: Mapping from physical state dimensions into checkpoint
+            dimensions; empty means the leading dimensions.
+        action_normalization: Serialized per-horizon statistics for a post-trained
+            checkpoint. Empty for a base model using LeRobot normalization.
+        state_normalization: Serialized state statistics for a post-trained
+            checkpoint. Empty for a base model using LeRobot normalization.
+        normalization_strategy: ``lerobot`` for replaceable dataset statistics,
+            or ``g05_stepwise`` for the fixed stats of post-trained checkpoints.
+        relative_action_mask: Physical action dimensions represented relative to
+            the current state. Unmarked dimensions, such as grippers, stay absolute.
+        embodiment: Prompt name serialized from the original checkpoint config.
+        num_inference_steps: Euler steps used to solve the flow-matching action field.
+        flow_sampling: Training-time flow-time distribution (``beta`` or ``uniform``).
+        num_flow_samples: Noisy flow samples drawn per training example.
+        flow_joint_training: Whether flow loss backpropagates through the VLM prefix.
+        discrete_action: Whether the checkpoint includes the optional action-token objective.
+        inference_action_head: Exclusive deployment head: ``fm`` or ``ar``.
+        action_attend_cot: Whether flow actions condition on generated chain-of-thought.
+        dtype: Model autocast precision; checkpoint precision islands remain fp32.
+        attn_implementation: Text and action-expert attention backend.
+        vision_attn_implementation: Vision attention backend, configured separately
+            because the released model used a different effective backend.
     """
 
+    # Policy I/O horizons. Only chunk_size shapes the trained prediction target;
+    # n_action_steps controls the inference action queue.
     chunk_size: int = 32
     n_action_steps: int = 16
     n_obs_steps: int = 1
+
+    # Image layout serialized per embodiment.
     image_size: tuple[int, int] = (256, 256)
     camera_keys: list[str] = field(default_factory=list)
     dummy_camera_keys: list[str] = field(default_factory=list)
+    optional_camera_keys: list[str] = field(default_factory=list)
     camera_order: list[str] = field(default_factory=list)
 
+    # Physical robot vectors are mapped into these checkpoint-width tensors.
     internal_action_dim: int = 27
     internal_state_dim: int = 27
     action_indices: list[int] = field(default_factory=list)
     state_indices: list[int] = field(default_factory=list)
-    action_norm_low: list = field(default_factory=list)
-    action_norm_high: list = field(default_factory=list)
-    state_norm_low: list = field(default_factory=list)
-    state_norm_high: list = field(default_factory=list)
     action_normalization: list[dict] = field(default_factory=list)
     state_normalization: list[dict] = field(default_factory=list)
+    normalization_strategy: str = "lerobot"
     relative_action_mask: list[bool] = field(default_factory=list)
+    action_feature_names: list[str] = field(default_factory=list)
     embodiment: str = "unknown"
 
+    # Tokenizer contract. Token IDs are serialized because converted artifacts
+    # are fully offline and may include checkpoint-specific action tokens.
     vocab_size: int = 252189
     pad_token_id: int = 0
     eos_token_id: int = 248044
@@ -56,6 +104,7 @@ class G05Config(PreTrainedConfig):
     max_task_tokens: int = 200
     max_prompt_length: int = 1200
 
+    # Qwen3.5 text backbone architecture.
     text_hidden_size: int = 2048
     text_intermediate_size: int = 6144
     text_num_layers: int = 24
@@ -66,6 +115,7 @@ class G05Config(PreTrainedConfig):
     rope_theta: float = 10_000_000.0
     mrope_section: tuple[int, int, int] = (11, 11, 10)
 
+    # Qwen3.5 vision tower architecture.
     vision_depth: int = 24
     vision_hidden_size: int = 1024
     vision_intermediate_size: int = 4096
@@ -74,6 +124,7 @@ class G05Config(PreTrainedConfig):
     vision_temporal_patch_size: int = 2
     vision_spatial_merge_size: int = 2
 
+    # Bidirectional flow-matching action expert architecture.
     expert_hidden_size: int = 1024
     expert_intermediate_size: int = 4096
     expert_num_layers: int = 24
@@ -81,6 +132,7 @@ class G05Config(PreTrainedConfig):
     expert_num_kv_heads: int = 2
     expert_head_dim: int = 256
 
+    # Flow matching and optional discrete action / CoT objectives.
     num_inference_steps: int = 10
     flow_sig_min: float = 0.001
     flow_sampling: str = "beta"
@@ -92,12 +144,19 @@ class G05Config(PreTrainedConfig):
     action_token_loss_weight: float = 0.0
     action_token_start_id: int | None = None
     action_token_end_id: int | None = None
+    max_cot_tokens: int = 300
+    max_action_tokens: int = 300
     predict_cot: bool = False
     discrete_action: bool = False
+    inference_action_head: str = "fm"
     action_attend_cot: bool = False
 
+    # Runtime numerical backends. Flash dependencies remain optional and local.
     dtype: str = "bfloat16"
+    attn_implementation: str = "eager"
+    vision_attn_implementation: str = "sdpa"
 
+    # LeRobot training presets; these do not affect checkpoint architecture.
     optimizer_lr: float = 1e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
@@ -112,13 +171,12 @@ class G05Config(PreTrainedConfig):
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
-            "STATE": NormalizationMode.IDENTITY,
-            "ACTION": NormalizationMode.IDENTITY,
+            "STATE": NormalizationMode.QUANTILES,
+            "ACTION": NormalizationMode.QUANTILES,
         }
     )
     tokenizer_subdir: str = "processor"
     action_tokenizer_subdir: str = "action_tokenizer"
-    source_variant: str | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -140,8 +198,25 @@ class G05Config(PreTrainedConfig):
             raise ValueError("flow_sampling must be 'beta' or 'uniform'")
         if self.num_flow_samples <= 0:
             raise ValueError("num_flow_samples must be positive")
+        if self.max_cot_tokens <= 0 or self.max_action_tokens <= 0:
+            raise ValueError("AR token limits must be positive")
+        if self.inference_action_head not in {"fm", "ar"}:
+            raise ValueError("inference_action_head must be 'fm' or 'ar'")
+        if self.inference_action_head == "ar" and not self.discrete_action:
+            raise ValueError("AR inference requires a checkpoint with discrete_action=true")
         if self.dtype not in {"bfloat16", "float32"}:
             raise ValueError("dtype must be 'bfloat16' or 'float32'")
+        supported_attention = {"eager", "sdpa", "flash_attention_2", "flash_attention_4"}
+        if self.attn_implementation not in supported_attention:
+            raise ValueError("unsupported text/action attention implementation")
+        if self.vision_attn_implementation not in supported_attention:
+            raise ValueError("unsupported vision attention implementation")
+        if self.normalization_strategy not in {"lerobot", "g05_stepwise"}:
+            raise ValueError("normalization_strategy must be 'lerobot' or 'g05_stepwise'")
+        if self.normalization_strategy == "g05_stepwise" and (
+            not self.action_normalization or not self.state_normalization
+        ):
+            raise ValueError("g05_stepwise requires serialized state and action statistics")
         if (self.action_token_start_id is None) != (self.action_token_end_id is None):
             raise ValueError("action token range must define both start and end")
         action_dim = self.output_features.get(ACTION)
@@ -149,9 +224,20 @@ class G05Config(PreTrainedConfig):
             action_dim is None or len(self.relative_action_mask) != action_dim.shape[-1]
         ):
             raise ValueError("relative_action_mask must match the physical action dimension")
+        if self.action_feature_names and (
+            action_dim is None or len(self.action_feature_names) != action_dim.shape[-1]
+        ):
+            raise ValueError("action_feature_names must match the physical action dimension")
+        if len(set(self.action_feature_names)) != len(self.action_feature_names):
+            raise ValueError("action_feature_names must be unique")
         duplicate_cameras = set(self.camera_keys) & set(self.dummy_camera_keys)
         if duplicate_cameras:
             raise ValueError(f"cameras cannot be both real and dummy: {sorted(duplicate_cameras)}")
+        unknown_optional_cameras = set(self.optional_camera_keys) - set(self.camera_keys)
+        if unknown_optional_cameras:
+            raise ValueError(
+                f"optional cameras must also be real camera keys: {sorted(unknown_optional_cameras)}"
+            )
         known_cameras = set(self.camera_keys) | set(self.dummy_camera_keys)
         if self.camera_order and (
             set(self.camera_order) != known_cameras or len(self.camera_order) != len(known_cameras)
