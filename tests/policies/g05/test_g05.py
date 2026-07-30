@@ -16,16 +16,21 @@ from lerobot.policies.g05.convert_g05_checkpoint import (
     _action_tokens,
     _camera_layout,
     _canonical_shape_meta,
+    _cot_prompt,
     _exported_action_tokens,
+    _inference_action_head,
+    _joint_frame_transform,
     _normalization_config,
     _normalization_specs,
     _processor_contract,
 )
 from lerobot.policies.g05.modeling_g05 import G05Policy
 from lerobot.policies.g05.processor_g05 import (
+    G05ActionFrameTransformStep,
     G05LiberoActionStep,
     G05LiberoObservationStep,
     G05PrepareInputsStep,
+    G05StateFrameTransformStep,
     G05StepwiseActionUnnormalizerStep,
     G05StepwiseNormalizerStep,
     _apply_normalization,
@@ -216,6 +221,8 @@ def test_action_attend_cot_inference_runs_before_flow() -> None:
 
     config = _tiny_config()
     config.action_attend_cot = True
+    config.predict_cot = True
+    config.cot_prompt = "predict subtask"
     config.max_cot_tokens = 1
     policy = G05Policy(config)
     policy.model.output_proj = FixedNextToken()
@@ -229,6 +236,40 @@ def test_action_attend_cot_inference_runs_before_flow() -> None:
     action = policy.predict_action_chunk(batch, noise=torch.zeros(2, 2, 4))
 
     assert action.shape == (2, 2, 2)
+
+
+def test_predict_cot_ar_inference_consumes_eov_before_action_tokens() -> None:
+    class SequencedNextToken(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden_states):
+            sequence = (4, 4, 7, 5)  # CoT stop, AR transition EOV, action token, EOS.
+            token = sequence[min(self.calls, len(sequence) - 1)]
+            self.calls += 1
+            logits = hidden_states.new_zeros(hidden_states.shape[0], 100)
+            logits[:, token] = 1
+            return logits
+
+    config = _tiny_config()
+    config.predict_cot = True
+    config.cot_prompt = "predict subtask"
+    config.discrete_action = True
+    config.action_token_start_id = 6
+    config.action_token_end_id = 10
+    policy = G05Policy(config)
+    policy.model.output_proj = SequencedNextToken()
+    batch = {
+        OBS_LANGUAGE_TOKENS: torch.tensor([[2, 3, 6]]),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 3, dtype=torch.bool),
+        "pixel_values": torch.randn(1, 1, 1, 3, 32, 32),
+        OBS_STATE: torch.tensor([[1.0, 2.0, 0.0, 3.0]]),
+    }
+
+    rows = policy.model.sample_action_tokens(batch)
+
+    assert [row.tolist() for row in rows] == [[7]]
 
 
 def test_discrete_action_loss_reuses_prefix_cache() -> None:
@@ -317,10 +358,42 @@ def test_processor_camera_layout_and_stepwise_action_stats(monkeypatch) -> None:
     assert ids[0, -1] == step.eov_token_id
 
     step.append_eov = False
+    FakeTokenizer.encoded_texts.clear()
     cot_ids, _ = step._prompt_ids(["task"], num_images=2)
     assert step.eov_token_id not in cot_ids
+    assert ";Action: " in FakeTokenizer.encoded_texts
+
+    step.predict_cot = True
+    step.cot_prompt = "predict bbox, subtask and action"
+    FakeTokenizer.encoded_texts.clear()
+    cot_ids, _ = step._prompt_ids(["task"], num_images=2)
+    assert step.eov_token_id not in cot_ids
+    assert ";predict bbox, subtask and action\n" in FakeTokenizer.encoded_texts
+
     training = step(transition)
     assert training[TransitionKey.COMPLEMENTARY_DATA][OBS_LANGUAGE_TOKENS][0, -1] == step.eov_token_id
+
+
+def test_so100_joint_frame_transform_is_invertible() -> None:
+    signs = [1, -1, 1, 1, 1, 1]
+    offsets = [0, 90, 90, 0, 0, 0]
+    arm_state = torch.tensor([[3.1, -34.3, 31.5, 55.9, -12.3, 13.4]])
+    transition = {
+        TransitionKey.OBSERVATION: {OBS_STATE: arm_state},
+        TransitionKey.ACTION: None,
+    }
+
+    state_step = G05StateFrameTransformStep(joint_signs=signs, joint_offsets=offsets)
+    model_transition = state_step(transition)
+    model_state = model_transition[TransitionKey.OBSERVATION][OBS_STATE]
+    assert torch.allclose(
+        model_state,
+        torch.tensor([[3.1, 124.3, 121.5, 55.9, -12.3, 13.4]]),
+    )
+
+    action_step = G05ActionFrameTransformStep(joint_signs=signs, joint_offsets=offsets)
+    arm_action = action_step({TransitionKey.ACTION: model_state})[TransitionKey.ACTION]
+    assert torch.allclose(arm_action, arm_state)
 
 
 def test_processor_factory_separates_base_and_stepwise_normalization(monkeypatch) -> None:
@@ -371,6 +444,43 @@ def test_conversion_resolves_normalization_from_original_config() -> None:
         "exception_modes": {"state": {"gripper": "q01/q99"}},
         "use_stepwise_action_norm": True,
     }
+
+
+def test_conversion_resolves_cot_prompt_and_action_head_from_checkpoint() -> None:
+    processor = {
+        "samples_builder": {
+            "_target_": "g05.data_processor.processor.samples_builder.MixedSamplesBuilder",
+            "eval_builder": {
+                "_target_": "g05.data_processor.processor.samples_builder.BBoxSubtaskCoTBuilder"
+            },
+        }
+    }
+
+    assert _cot_prompt(processor) == "predict bbox, subtask and action"
+    assert (
+        _inference_action_head(
+            {
+                "continuous_action": False,
+                "discrete_action": True,
+                "return_continuous_action": False,
+            }
+        )
+        == "ar"
+    )
+    assert (
+        _inference_action_head(
+            {
+                "continuous_action": True,
+                "discrete_action": True,
+                "return_continuous_action": True,
+            }
+        )
+        == "fm"
+    )
+    assert _joint_frame_transform("so100", 6, 6) == (
+        [1.0, -1.0, 1.0, 1.0, 1.0, 1.0],
+        [0.0, 90.0, 90.0, 0.0, 0.0, 0.0],
+    )
 
 
 def test_conversion_model_normalization_override_is_atomic() -> None:

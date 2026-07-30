@@ -243,10 +243,16 @@ class G05Model(nn.Module):
         )
         return outputs, position_ids, attention_mask
 
-    def prefill(self, batch: dict[str, Tensor]) -> tuple[DynamicCache, Tensor, Tensor, Tensor]:
+    def prefill(self, batch: dict[str, Tensor]) -> tuple[DynamicCache, Tensor, Tensor, Tensor, Tensor]:
         """Encode the multimodal prefix once for flow and token objectives."""
         outputs, position_ids, attention_mask = self.vlm_forward(batch, use_cache=True)
-        return outputs.past_key_values, position_ids, attention_mask, outputs.last_hidden_state[:, -1:]
+        return (
+            outputs.past_key_values,
+            position_ids,
+            attention_mask,
+            outputs.last_hidden_state[:, -1:],
+            batch[OBS_LANGUAGE_TOKENS],
+        )
 
     def copy_vlm_cache(self, source: DynamicCache) -> DynamicCache:
         """Clone mutable linear-attention state while sharing immutable prefix KV."""
@@ -259,12 +265,54 @@ class G05Model(nn.Module):
             destination.layers[index] = destination_layer
         return destination
 
+    def sample_next_token(self, logits: Tensor, history: Tensor | None = None) -> Tensor:
+        """Apply the AR sampling contract serialized from the source checkpoint."""
+        scores = logits.float().clone()
+        if history is not None and history.numel():
+            if self.config.ar_repetition_penalty != 1:
+                previous_scores = scores.gather(1, history)
+                previous_scores = torch.where(
+                    previous_scores < 0,
+                    previous_scores * self.config.ar_repetition_penalty,
+                    previous_scores / self.config.ar_repetition_penalty,
+                )
+                scores.scatter_(1, history, previous_scores)
+
+            ngram_size = self.config.ar_no_repeat_ngram_size
+            if ngram_size > 0 and history.shape[1] >= ngram_size - 1:
+                for batch_index, row in enumerate(history.tolist()):
+                    prefix = tuple(row[-(ngram_size - 1) :]) if ngram_size > 1 else ()
+                    banned = {
+                        row[index + ngram_size - 1]
+                        for index in range(len(row) - ngram_size + 1)
+                        if tuple(row[index : index + ngram_size - 1]) == prefix
+                    }
+                    if banned:
+                        scores[batch_index, list(banned)] = -torch.inf
+
+        if not self.config.ar_do_sample or self.config.ar_temperature == 0:
+            return scores.argmax(dim=-1)
+
+        scores /= self.config.ar_temperature
+        top_k = min(self.config.ar_top_k, scores.shape[-1])
+        if top_k > 0:
+            threshold = torch.topk(scores, top_k, dim=-1).values[:, -1:]
+            scores.masked_fill_(scores < threshold, -torch.inf)
+        if self.config.ar_top_p < 1:
+            sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
+            cumulative = sorted_scores.softmax(dim=-1).cumsum(dim=-1)
+            remove = cumulative > self.config.ar_top_p
+            remove[:, 1:] = remove[:, :-1].clone()
+            remove[:, 0] = False
+            scores.scatter_(1, sorted_indices, sorted_scores.masked_fill(remove, -torch.inf))
+        return torch.multinomial(scores.softmax(dim=-1), num_samples=1).squeeze(1)
+
     def generate_cot(
         self,
         batch: dict[str, Tensor],
-        prefix: tuple[DynamicCache, Tensor, Tensor, Tensor],
-    ) -> tuple[DynamicCache, Tensor, Tensor, Tensor]:
-        """Greedily extend the VLM prefix until every sample emits EOV or EOS.
+        prefix: tuple[DynamicCache, Tensor, Tensor, Tensor, Tensor],
+    ) -> tuple[DynamicCache, Tensor, Tensor, Tensor, Tensor]:
+        """Extend the VLM prefix until every sample emits EOV or EOS.
 
         The released SO101 checkpoint conditions its flow expert on this generated
         context. Stop tokens are returned by the language head but are not committed
@@ -272,21 +320,26 @@ class G05Model(nn.Module):
         receive masked cache slots while other rows continue; their recurrent linear
         attention state is restored after each padded forward.
         """
-        cache, position_ids, attention_mask, last_hidden = prefix
-        input_ids = batch[OBS_LANGUAGE_TOKENS]
+        cache, position_ids, attention_mask, last_hidden, input_ids = prefix
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         stop_ids = {self.config.eos_token_id}
         if self.config.eov_token_id is not None:
             stop_ids.add(self.config.eov_token_id)
+        generated_history = None
 
         for _ in range(self.config.max_cot_tokens):
-            next_token = self.output_proj(last_hidden[:, -1]).argmax(dim=-1)
+            next_token = self.sample_next_token(self.output_proj(last_hidden[:, -1]), generated_history)
             is_stop = torch.zeros_like(finished)
             for token_id in stop_ids:
                 is_stop |= next_token.eq(token_id)
             finished |= is_stop
             if bool(finished.all()):
                 break
+            generated_history = (
+                next_token.unsqueeze(1)
+                if generated_history is None
+                else torch.cat((generated_history, next_token.unsqueeze(1)), dim=1)
+            )
 
             # Stop tokens are not part of the action-conditioning prefix. Finished
             # rows use a masked pad slot so batched cache lengths remain rectangular.
@@ -324,18 +377,20 @@ class G05Model(nn.Module):
                 last_hidden,
                 outputs.last_hidden_state,
             )
-        return cache, position_ids, attention_mask, last_hidden
+        return cache, position_ids, attention_mask, last_hidden, input_ids
 
     @torch.no_grad()
     def sample_action_tokens(self, batch: dict[str, Tensor]) -> list[Tensor]:
-        """Greedily generate one serialized ActionCodec sequence per observation.
+        """Generate one serialized ActionCodec sequence per observation.
 
         This path only runs the vision/VLM prefix and language head. It never calls
         the flow-matching action expert, allowing AR and FM deployment costs to be
         measured independently.
         """
-        cache, _, attention_mask, last_hidden = self.prefill(batch)
-        input_ids = batch[OBS_LANGUAGE_TOKENS]
+        prefix = self.prefill(batch)
+        if self.config.predict_cot:
+            prefix = self.generate_cot(batch, prefix)
+        cache, _, attention_mask, last_hidden, input_ids = prefix
         start = self.config.action_token_start_id
         end = self.config.action_token_end_id
         if start is None or end is None:
@@ -343,22 +398,33 @@ class G05Model(nn.Module):
 
         batch_size = input_ids.shape[0]
         finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        action_started = torch.zeros_like(finished)
         generated: list[list[Tensor]] = [[] for _ in range(batch_size)]
         full_ids = input_ids
+        generated_history = None
 
         for _ in range(self.config.max_action_tokens):
-            next_token = self.output_proj(last_hidden[:, -1]).argmax(dim=-1)
+            next_token = self.sample_next_token(self.output_proj(last_hidden[:, -1]), generated_history)
             is_action = next_token.ge(start) & next_token.lt(end)
             live_action = (~finished) & is_action
             for batch_index in live_action.nonzero(as_tuple=False).flatten().tolist():
                 generated[batch_index].append(next_token[batch_index])
 
-            # The training suffix terminates with EOS. Treating any other token
-            # outside the ActionCodec vocabulary as terminal matches the source
-            # decoder's behavior for an absent or malformed action segment.
-            finished |= ~is_action
+            # CoT generation stops before committing EOV to the cache, exactly as
+            # the source pipeline does. The AR action stage consumes that one EOV
+            # transition token, then collects the contiguous ActionCodec payload.
+            transition_eov = (
+                self.config.predict_cot & (~action_started) & next_token.eq(self.config.eov_token_id)
+            )
+            finished |= ~(is_action | transition_eov)
+            action_started |= live_action
             if bool(finished.all()):
                 break
+            generated_history = (
+                next_token.unsqueeze(1)
+                if generated_history is None
+                else torch.cat((generated_history, next_token.unsqueeze(1)), dim=1)
+            )
 
             input_token = next_token.masked_fill(finished, self.config.pad_token_id).unsqueeze(1)
             full_ids = torch.cat((full_ids, input_token), dim=1)
@@ -395,12 +461,12 @@ class G05Model(nn.Module):
     def autoregressive_loss(
         self,
         batch: dict[str, Tensor],
-        prefill: tuple[DynamicCache, Tensor, Tensor, Tensor],
+        prefill: tuple[DynamicCache, Tensor, Tensor, Tensor, Tensor],
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Compute shifted CE and action/CoT accuracies over labeled suffix tokens."""
         if ACTION_TOKENS not in batch:
             raise ValueError("discrete G0.5 training requires action.tokens from the processor")
-        prefix_cache, _, _, prefix_last_hidden = prefill
+        prefix_cache, _, _, prefix_last_hidden, _ = prefill
         suffix_cache = self.copy_vlm_cache(prefix_cache)
         prefix_ids = batch[OBS_LANGUAGE_TOKENS]
         prefix_mask = batch[OBS_LANGUAGE_ATTENTION_MASK].bool()
@@ -441,11 +507,11 @@ class G05Model(nn.Module):
     def flow_loss(
         self,
         batch: dict[str, Tensor],
-        prefill: tuple[DynamicCache, Tensor, Tensor, Tensor] | None = None,
+        prefill: tuple[DynamicCache, Tensor, Tensor, Tensor, Tensor] | None = None,
     ) -> Tensor:
         """Compute the masked conditional-flow velocity objective."""
         actions = batch[ACTION]
-        prefix_cache, prefix_position_ids, prefix_attention_mask, _ = prefill or self.prefill(batch)
+        prefix_cache, prefix_position_ids, prefix_attention_mask, _, _ = prefill or self.prefill(batch)
         if not self.config.flow_joint_training:
             # Post-training variants optimize only the expert; detaching cached KV
             # avoids retaining the large VLM backward graph.
@@ -518,9 +584,9 @@ class G05Model(nn.Module):
     def sample_actions(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Integrate the learned velocity field from Gaussian noise to actions."""
         prefix = self.prefill(batch)
-        if self.config.action_attend_cot:
+        if self.config.predict_cot:
             prefix = self.generate_cot(batch, prefix)
-        prefix_cache, prefix_position_ids, prefix_attention_mask, _ = prefix
+        prefix_cache, prefix_position_ids, prefix_attention_mask, _, _ = prefix
         input_ids = batch[OBS_LANGUAGE_TOKENS]
         batch_size = input_ids.shape[0]
         if noise is None:

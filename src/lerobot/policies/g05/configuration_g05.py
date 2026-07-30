@@ -52,6 +52,8 @@ class G05Config(PreTrainedConfig):
             or ``g05_stepwise`` for the fixed stats of post-trained checkpoints.
         relative_action_mask: Physical action dimensions represented relative to
             the current state. Unmarked dimensions, such as grippers, stay absolute.
+        joint_signs: Optional physical-arm to checkpoint-frame sign transform.
+        joint_offsets: Optional physical-arm to checkpoint-frame offset transform.
         embodiment: Prompt name serialized from the original checkpoint config.
         num_inference_steps: Euler steps used to solve the flow-matching action field.
         flow_sampling: Training-time flow-time distribution (``beta`` or ``uniform``).
@@ -59,6 +61,9 @@ class G05Config(PreTrainedConfig):
         flow_joint_training: Whether flow loss backpropagates through the VLM prefix.
         discrete_action: Whether the checkpoint includes the optional action-token objective.
         inference_action_head: Exclusive deployment head: ``fm`` or ``ar``.
+        cot_prompt: Inference instruction placed immediately before the CoT boundary.
+        predict_cot: Deployment switch. When enabled, generate CoT before the
+            configured action head; when disabled, use the direct-action prefix.
         action_attend_cot: Whether flow actions condition on generated chain-of-thought.
         dtype: Model autocast precision; checkpoint precision islands remain fp32.
         attn_implementation: Text and action-expert attention backend.
@@ -89,6 +94,8 @@ class G05Config(PreTrainedConfig):
     normalization_strategy: str = "lerobot"
     relative_action_mask: list[bool] = field(default_factory=list)
     action_feature_names: list[str] = field(default_factory=list)
+    joint_signs: list[float] | None = None
+    joint_offsets: list[float] | None = None
     embodiment: str = "unknown"
 
     # Tokenizer contract. Token IDs are serialized because converted artifacts
@@ -146,6 +153,13 @@ class G05Config(PreTrainedConfig):
     action_token_end_id: int | None = None
     max_cot_tokens: int = 300
     max_action_tokens: int = 300
+    ar_do_sample: bool = False
+    ar_temperature: float = 0.7
+    ar_top_k: int = 128
+    ar_top_p: float = 0.95
+    ar_repetition_penalty: float = 1.0
+    ar_no_repeat_ngram_size: int = 0
+    cot_prompt: str = ""
     predict_cot: bool = False
     discrete_action: bool = False
     inference_action_head: str = "fm"
@@ -200,6 +214,14 @@ class G05Config(PreTrainedConfig):
             raise ValueError("num_flow_samples must be positive")
         if self.max_cot_tokens <= 0 or self.max_action_tokens <= 0:
             raise ValueError("AR token limits must be positive")
+        if self.ar_temperature < 0:
+            raise ValueError("ar_temperature must be non-negative")
+        if self.ar_top_k < 0 or not 0 < self.ar_top_p <= 1:
+            raise ValueError("invalid AR top-k/top-p sampling configuration")
+        if self.ar_repetition_penalty <= 0 or self.ar_no_repeat_ngram_size < 0:
+            raise ValueError("invalid AR repetition configuration")
+        if self.predict_cot and not self.cot_prompt.strip():
+            raise ValueError("predict_cot=true requires the checkpoint's inference CoT prompt")
         if self.inference_action_head not in {"fm", "ar"}:
             raise ValueError("inference_action_head must be 'fm' or 'ar'")
         if self.inference_action_head == "ar" and not self.discrete_action:
@@ -217,6 +239,16 @@ class G05Config(PreTrainedConfig):
             not self.action_normalization or not self.state_normalization
         ):
             raise ValueError("g05_stepwise requires serialized state and action statistics")
+        if (self.joint_signs is None) != (self.joint_offsets is None):
+            raise ValueError("joint_signs and joint_offsets must be configured together")
+        if self.joint_signs is not None:
+            state = (self.input_features or {}).get(OBS_STATE)
+            action = (self.output_features or {}).get(ACTION)
+            physical_dims = {feature.shape[-1] for feature in (state, action) if feature is not None}
+            if len(self.joint_signs) != len(self.joint_offsets) or any(
+                len(self.joint_signs) > dimension for dimension in physical_dims
+            ):
+                raise ValueError("joint frame transform exceeds the physical state/action width")
         if (self.action_token_start_id is None) != (self.action_token_end_id is None):
             raise ValueError("action token range must define both start and end")
         action_dim = self.output_features.get(ACTION)

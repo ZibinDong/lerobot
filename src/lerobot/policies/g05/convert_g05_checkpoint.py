@@ -34,6 +34,19 @@ PUBLISHED_VARIANT_DEFAULTS = {
     "g05-so101": {"embodiment": "so100", "n_action_steps": 32},
 }
 
+_COT_PROMPTS_BY_BUILDER = {
+    "SubtaskCoTBuilder": "predict subtask",
+    "TaskAsSubtaskCoTBuilder": "predict subtask",
+    "FutureSubtaskCoTBuilder": "predict future subtask",
+    "BBoxCoTBuilder": "predict bbox",
+    "BBoxSubtaskCoTBuilder": "predict bbox, subtask and action",
+    "Trace2DCoTBuilder": "predict 2d trace of gripper",
+    "SubtaskActionHintCoTBuilder": "predict subtask and action hint",
+}
+
+_SO100_LEGACY_JOINT_SIGNS = [1.0, -1.0, 1.0, 1.0, 1.0, 1.0]
+_SO100_LEGACY_JOINT_OFFSETS = [0.0, 90.0, 90.0, 0.0, 0.0, 0.0]
+
 
 def _load_yaml(path: Path) -> dict[str, Any]:
     try:
@@ -196,7 +209,57 @@ def _processor_contract(processor: dict[str, Any]) -> dict[str, Any]:
             contract.setdefault("action_state_transforms", []).append(step)
         elif target.endswith("G05ModelBoundaryTransform"):
             contract["image_keys"] = step.get("image_keys")
+            contract["samples_builder"] = step.get("samples_builder")
     return contract
+
+
+def _cot_prompt(processor: dict[str, Any]) -> str:
+    """Resolve the inference-only prompt used before the source EOC boundary."""
+
+    builder = processor.get("samples_builder")
+    if not isinstance(builder, dict):
+        raise ValueError("predict_cot=true but the checkpoint has no samples_builder metadata")
+    target = str(builder.get("_target_", ""))
+    if target.endswith("MixedSamplesBuilder"):
+        builder = builder.get("eval_builder")
+        if not isinstance(builder, dict):
+            raise ValueError("the checkpoint's mixed samples builder has no eval_builder")
+        target = str(builder.get("_target_", ""))
+    builder_name = target.rsplit(".", 1)[-1]
+    try:
+        return _COT_PROMPTS_BY_BUILDER[builder_name]
+    except KeyError as error:
+        raise ValueError(
+            f"unsupported G0.5 inference CoT builder {builder_name!r}; "
+            "the converter cannot safely reconstruct its pre-EOC prompt"
+        ) from error
+
+
+def _inference_action_head(architecture: dict[str, Any]) -> str:
+    """Select the deployment head from the checkpoint's own action flags."""
+
+    continuous = bool(architecture.get("continuous_action", False))
+    discrete = bool(architecture.get("discrete_action", False))
+    if continuous and discrete:
+        return "fm" if bool(architecture.get("return_continuous_action", True)) else "ar"
+    if continuous:
+        return "fm"
+    if discrete:
+        return "ar"
+    raise ValueError("checkpoint enables neither continuous nor discrete action inference")
+
+
+def _joint_frame_transform(
+    embodiment: str, physical_state_dim: int, physical_action_dim: int
+) -> tuple[list[float] | None, list[float] | None]:
+    """Return the legacy SO100 training-frame transform used by its deploy client."""
+
+    if embodiment not in {"so100", "so101"}:
+        return None, None
+    expected_width = len(_SO100_LEGACY_JOINT_SIGNS)
+    if physical_state_dim != expected_width or physical_action_dim != expected_width:
+        raise ValueError("the legacy SO100 joint-frame transform requires six state/action dimensions")
+    return list(_SO100_LEGACY_JOINT_SIGNS), list(_SO100_LEGACY_JOINT_OFFSETS)
 
 
 def _embodiment_metadata(hydra: dict[str, Any], embodiment: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -511,6 +574,7 @@ def _build_config(
     state_indices = _layout_indices(state_items, merge_spec, parts_meta)
     physical_action_dim = len(action_indices)
     physical_state_dim = len(state_indices)
+    joint_signs, joint_offsets = _joint_frame_transform(embodiment, physical_state_dim, physical_action_dim)
     embodiment_stats = dict(stats[embodiment])
     if "state" not in embodiment_stats and "proprio" in embodiment_stats:
         embodiment_stats["state"] = embodiment_stats["proprio"]
@@ -591,6 +655,7 @@ def _build_config(
         architecture["vision"],
         architecture["fm"],
     )
+    predict_cot = bool(architecture["predict_cot"])
     optimizer_lr = float(model.get("learning_rate") or 1e-5)
     supported_fm_contract = {
         "time_convention": "pi_convention",
@@ -631,6 +696,8 @@ def _build_config(
         state_normalization=state_normalization,
         normalization_strategy="lerobot" if use_lerobot_normalization else "g05_stepwise",
         relative_action_mask=_relative_action_mask(embodiment_processor, action_items, state_items),
+        joint_signs=joint_signs,
+        joint_offsets=joint_offsets,
         embodiment=embodiment,
         vocab_size=vocab_size,
         pad_token_id=int(architecture["pad_token_id"]),
@@ -672,8 +739,16 @@ def _build_config(
         action_token_end_id=base_tokenizer_size + len(action_tokens),
         max_cot_tokens=int(architecture["ar"].get("max_new_tokens", 300)),
         max_action_tokens=int(architecture["ar"].get("max_new_tokens", 300)),
-        predict_cot=bool(architecture["predict_cot"]),
+        ar_do_sample=bool(architecture["ar"].get("do_sample", False)),
+        ar_temperature=float(architecture["ar"].get("temperature", 0.7)),
+        ar_top_k=int(architecture["ar"].get("top_k", 128)),
+        ar_top_p=float(architecture["ar"].get("top_p", 0.95)),
+        ar_repetition_penalty=float(architecture["ar"].get("repetition_penalty", 1.0)),
+        ar_no_repeat_ngram_size=int(architecture["ar"].get("no_repeat_ngram_size", 0)),
+        cot_prompt=_cot_prompt(embodiment_processor) if predict_cot else "",
+        predict_cot=predict_cot,
         discrete_action=bool(architecture["discrete_action"]),
+        inference_action_head=_inference_action_head(architecture),
         action_attend_cot=bool(architecture["action_attend_cot"]),
         attn_implementation=str(architecture.get("attn_implementation", "eager")),
         action_feature_names=(
