@@ -218,6 +218,72 @@ class G05StepwiseNormalizerStep(ProcessorStep):
         return features
 
 
+@ProcessorStepRegistry.register(name="g05_state_frame_transform")
+@dataclass
+class G05StateFrameTransformStep(ProcessorStep):
+    """Convert physical-arm state into the coordinate frame used for training."""
+
+    joint_signs: list[float] | None = None
+    joint_offsets: list[float] | None = None
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        if self.joint_signs is None or self.joint_offsets is None:
+            return transition
+        observation = transition.get(TransitionKey.OBSERVATION)
+        if not isinstance(observation, dict) or OBS_STATE not in observation:
+            return transition
+        transition = transition.copy()
+        observation = observation.copy()
+        state = torch.as_tensor(observation[OBS_STATE], dtype=torch.float32).clone()
+        width = len(self.joint_signs)
+        signs = state.new_tensor(self.joint_signs)
+        offsets = state.new_tensor(self.joint_offsets)
+        state[..., :width] = signs * state[..., :width] + offsets
+        observation[OBS_STATE] = state
+        transition[TransitionKey.OBSERVATION] = observation
+        return transition
+
+    def get_config(self) -> dict[str, Any]:
+        return {"joint_signs": self.joint_signs, "joint_offsets": self.joint_offsets}
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@ProcessorStepRegistry.register(name="g05_action_frame_transform")
+@dataclass
+class G05ActionFrameTransformStep(ProcessorStep):
+    """Convert checkpoint-frame actions back into the physical arm frame."""
+
+    joint_signs: list[float] | None = None
+    joint_offsets: list[float] | None = None
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        if self.joint_signs is None or self.joint_offsets is None:
+            return transition
+        action = transition.get(TransitionKey.ACTION)
+        if action is None:
+            return transition
+        transition = transition.copy()
+        action = torch.as_tensor(action, dtype=torch.float32).clone()
+        width = len(self.joint_signs)
+        signs = action.new_tensor(self.joint_signs)
+        offsets = action.new_tensor(self.joint_offsets)
+        action[..., :width] = signs * (action[..., :width] - offsets)
+        transition[TransitionKey.ACTION] = action
+        return transition
+
+    def get_config(self) -> dict[str, Any]:
+        return {"joint_signs": self.joint_signs, "joint_offsets": self.joint_offsets}
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 @ProcessorStepRegistry.register(name="g05_prepare_inputs")
 @dataclass
 class G05PrepareInputsStep(ProcessorStep):
@@ -246,11 +312,15 @@ class G05PrepareInputsStep(ProcessorStep):
     camera_order: list[str] | None = None
     optional_camera_keys: list[str] | None = None
     append_eov: bool = True
+    predict_cot: bool = False
+    cot_prompt: str = ""
 
     def __post_init__(self) -> None:
         require_package("transformers", extra="g05")
         if not self.tokenizer_path:
             raise ValueError("tokenizer_path must resolve inside the G0.5 artifact")
+        if self.predict_cot and not self.cot_prompt.strip():
+            raise ValueError("predict_cot=true requires the checkpoint's inference CoT prompt")
         from transformers import AutoTokenizer
 
         self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_path, local_files_only=True)
@@ -335,9 +405,14 @@ class G05PrepareInputsStep(ProcessorStep):
             row += task_ids[: self.max_task_tokens]
             row += self._tokenizer.encode(" State: ", add_special_tokens=False)
             row += [self.state_token_id] * self.n_obs_steps
-            assistant_prefix = (
-                ";<|im_end|>\n<|im_start|>robot\nAction: " if uses_chat_template else ";Action: "
-            )
+            assistant_prefix = ";<|im_end|>\n<|im_start|>robot\n" if uses_chat_template else ";"
+            if self.predict_cot and not append_eov:
+                # Source ``context_only`` inference ends immediately before EOC:
+                # ``... State: <state>;<cot_prompt>\n<EOC>...``. The model then
+                # generates the CoT tail, ``Action: ``, and finally EOV.
+                assistant_prefix += self.cot_prompt.rstrip("\n") + "\n"
+            else:
+                assistant_prefix += "Action: "
             row += self._tokenizer.encode(assistant_prefix, add_special_tokens=False)
             if append_eov:
                 row += [self.eov_token_id]
@@ -489,7 +564,9 @@ def make_g05_pre_post_processors(
         eos_token_id=config.eos_token_id,
         camera_order=config.camera_order,
         optional_camera_keys=config.optional_camera_keys,
-        append_eov=not config.action_attend_cot,
+        append_eov=not config.predict_cot,
+        predict_cot=config.predict_cot,
+        cot_prompt=config.cot_prompt,
     )
     if config.normalization_strategy == "lerobot":
         normalize_step = steps.normalize
@@ -507,6 +584,10 @@ def make_g05_pre_post_processors(
         input_steps=[
             steps.rename_observations,
             steps.add_batch_dim,
+            G05StateFrameTransformStep(
+                joint_signs=config.joint_signs,
+                joint_offsets=config.joint_offsets,
+            ),
             relative_step,
             steps.to_device,
             normalize_step,
@@ -516,6 +597,10 @@ def make_g05_pre_post_processors(
             unnormalize_step,
             AbsoluteActionsProcessorStep(
                 enabled=bool(config.relative_action_mask), relative_step=relative_step
+            ),
+            G05ActionFrameTransformStep(
+                joint_signs=config.joint_signs,
+                joint_offsets=config.joint_offsets,
             ),
             steps.to_cpu,
         ],
@@ -567,6 +652,11 @@ def make_g05_pre_post_processors_from_pretrained(
             "g05_prepare_inputs": {
                 "tokenizer_path": str(tokenizer_path),
                 "action_tokenizer_path": str(action_tokenizer_path) if config.discrete_action else "",
+                # Keep CLI config overrides (notably --policy.predict_cot) in
+                # sync with the serialized processor from the artifact.
+                "predict_cot": config.predict_cot,
+                "cot_prompt": config.cot_prompt,
+                "append_eov": not config.predict_cot,
             }
         },
         to_transition=batch_to_transition,

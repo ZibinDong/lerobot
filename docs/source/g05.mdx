@@ -69,7 +69,6 @@ uv run lerobot-eval \
     --policy.discrete_action=true \
     --policy.continuous_action=false \
     --policy.predict_cot=false \
-    --policy.action_attend_cot=false \
     --env.type=libero \
     --env.task="$SUITE" \
     --env.camera_name_mapping='{"agentview_image":"image","robot0_eye_in_hand_image":"wrist_image"}' \
@@ -111,7 +110,6 @@ uv run lerobot-eval \
     --policy.discrete_action=false \
     --policy.continuous_action=true \
     --policy.predict_cot=false \
-    --policy.action_attend_cot=false \
     --env.type=libero \
     --env.task="$SUITE" \
     --env.camera_name_mapping='{"agentview_image":"image","robot0_eye_in_hand_image":"wrist_image"}' \
