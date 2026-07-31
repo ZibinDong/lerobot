@@ -177,8 +177,8 @@ python -m lerobot.async_inference.robot_client \
   --pretrained_name_or_path=/path/to/lerobot-g05-so100 \
   --policy_device=cuda \
   --actions_per_chunk=32 \
-  --chunk_size_threshold=0.5 \
-  --aggregate_fn_name=weighted_average \
+  --chunk_size_threshold=0.0 \
+  --aggregate_fn_name=latest_only \
   --fps=30
 ```
 
@@ -186,6 +186,20 @@ Camera keys must match the artifact's `camera_keys`, exactly as for
 `lerobot-rollout`. `--fps` sets the rate at which the client consumes the chunk;
 confirm it against the frequency the checkpoint was trained and deployed at
 rather than inferring it from the checkpoint name.
+
+The chunking flags are set to reproduce the reference G0.5 client rather than to
+maximise smoothness. `actions_per_chunk=32` serves the whole predicted chunk.
+`chunk_size_threshold=0.0` asks for a new chunk only once the queue is empty, so
+no chunk is ever recomputed from a mid-chunk observation; the default `0.5`
+requests a replacement halfway through instead. Because consecutive chunks then
+never overlap, `latest_only` is the matching aggregation — the default
+`weighted_average` blends overlapping actions, which the reference client
+explicitly does not do.
+
+The trade-off is a stall: the arm holds its last commanded target while the
+model recomputes, exactly as the reference client behaves. Raise
+`chunk_size_threshold` to overlap inference with execution once numerical parity
+has been confirmed on hardware.
 
 When the artifact sets `predict_cot=true`, the server prints the reasoning behind
 every recomputed chunk:
