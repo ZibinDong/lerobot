@@ -280,6 +280,190 @@ def test_predict_cot_ar_inference_consumes_eov_before_action_tokens() -> None:
     assert [row.tolist() for row in rows] == [[7]]
 
 
+def _cot_ar_policy() -> G05Config:
+    config = _tiny_config()
+    config.predict_cot = True
+    config.cot_prompt = "predict subtask"
+    config.discrete_action = True
+    config.continuous_action = False
+    config.action_token_start_id = 6
+    config.action_token_end_id = 10
+    return config
+
+
+def test_ar_transition_commits_the_cot_stop_token_instead_of_redecoding() -> None:
+    """The AR stage must reuse the CoT stop token, not re-decode the frozen state.
+
+    Under ``ar_do_sample`` a second decode of the same hidden state draws a fresh
+    sample, so the transition token would usually not come back as EOV and the row
+    would terminate with an empty ActionCodec payload.
+    """
+
+    class RedecodeDiverges(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden_states):
+            # Call 1 ends the CoT with EOV. Call 2 is the AR stage's first decode
+            # and deliberately returns a token that is neither EOV nor an action
+            # token, standing in for a diverging sample.
+            sequence = (4, 50, 7, 5)
+            token = sequence[min(self.calls, len(sequence) - 1)]
+            self.calls += 1
+            logits = hidden_states.new_zeros(hidden_states.shape[0], 100)
+            logits[:, token] = 1
+            return logits
+
+    policy = G05Policy(_cot_ar_policy())
+    policy.model.output_proj = RedecodeDiverges()
+    batch = {
+        OBS_LANGUAGE_TOKENS: torch.tensor([[2, 3, 6]]),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 3, dtype=torch.bool),
+        "pixel_values": torch.randn(1, 1, 1, 3, 32, 32),
+        OBS_STATE: torch.tensor([[1.0, 2.0, 0.0, 3.0]]),
+    }
+
+    rows = policy.model.sample_action_tokens(batch)
+
+    assert [row.tolist() for row in rows] == [[7]]
+
+
+def test_generate_cot_reports_stop_tokens_and_history() -> None:
+    class TwoTokenCot(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden_states):
+            sequence = (9, 4)  # One CoT token, then EOV.
+            token = sequence[min(self.calls, len(sequence) - 1)]
+            self.calls += 1
+            logits = hidden_states.new_zeros(hidden_states.shape[0], 100)
+            logits[:, token] = 1
+            return logits
+
+    policy = G05Policy(_cot_ar_policy())
+    policy.model.output_proj = TwoTokenCot()
+    batch = {
+        OBS_LANGUAGE_TOKENS: torch.tensor([[2, 3, 6]]),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 3, dtype=torch.bool),
+        "pixel_values": torch.randn(1, 1, 1, 3, 32, 32),
+        OBS_STATE: torch.tensor([[1.0, 2.0, 0.0, 3.0]]),
+    }
+
+    _, cot = policy.model.generate_cot(batch, policy.model.prefill(batch))
+
+    assert cot.stop_tokens.tolist() == [policy.config.eov_token_id]
+    # The CoT tokens stay visible so repetition penalties span both AR stages.
+    assert cot.history.tolist() == [[9]]
+
+
+def test_ar_stage_seeds_repetition_history_from_the_cot_stage() -> None:
+    """no_repeat_ngram / repetition_penalty must see the CoT tokens too.
+
+    The released checkpoint sets repetition_penalty=1.2 and
+    no_repeat_ngram_size=10, which HF applies over the whole sequence.
+    """
+
+    class TwoTokenCot(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden_states):
+            sequence = (9, 4, 7, 5)  # CoT token, EOV, action token, EOS.
+            token = sequence[min(self.calls, len(sequence) - 1)]
+            self.calls += 1
+            logits = hidden_states.new_zeros(hidden_states.shape[0], 100)
+            logits[:, token] = 1
+            return logits
+
+    policy = G05Policy(_cot_ar_policy())
+    policy.model.output_proj = TwoTokenCot()
+    seen: list[torch.Tensor | None] = []
+    original = policy.model.sample_next_token
+
+    def record(logits, history=None):
+        seen.append(None if history is None else history.clone())
+        return original(logits, history)
+
+    policy.model.sample_next_token = record
+    batch = {
+        OBS_LANGUAGE_TOKENS: torch.tensor([[2, 3, 6]]),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 3, dtype=torch.bool),
+        "pixel_values": torch.randn(1, 1, 1, 3, 32, 32),
+        OBS_STATE: torch.tensor([[1.0, 2.0, 0.0, 3.0]]),
+    }
+
+    policy.model.sample_action_tokens(batch)
+
+    # Calls: [0] first CoT token (no history), [1] CoT stop decode, then the AR
+    # stage, which must already carry the CoT token rather than restarting empty.
+    assert seen[0] is None
+    assert seen[2] is not None and seen[2].tolist() == [[9]]
+
+
+def test_ar_inference_without_an_eov_token_does_not_crash() -> None:
+    class ActionThenEos(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, hidden_states):
+            sequence = (7, 5)
+            token = sequence[min(self.calls, len(sequence) - 1)]
+            self.calls += 1
+            logits = hidden_states.new_zeros(hidden_states.shape[0], 100)
+            logits[:, token] = 1
+            return logits
+
+    config = _tiny_config()
+    config.discrete_action = True
+    config.continuous_action = False
+    config.action_token_start_id = 6
+    config.action_token_end_id = 10
+    config.eov_token_id = None
+    policy = G05Policy(config)
+    policy.model.output_proj = ActionThenEos()
+    batch = {
+        OBS_LANGUAGE_TOKENS: torch.tensor([[2, 3, 6]]),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 3, dtype=torch.bool),
+        "pixel_values": torch.randn(1, 1, 1, 3, 32, 32),
+        OBS_STATE: torch.tensor([[1.0, 2.0, 0.0, 3.0]]),
+    }
+
+    rows = policy.model.sample_action_tokens(batch)
+
+    assert [row.tolist() for row in rows] == [[7]]
+
+
+def test_empty_action_token_row_warns_before_zero_chunk(caplog) -> None:
+    config = _tiny_config()
+    config.discrete_action = True
+    config.continuous_action = False
+    config.action_token_start_id = 6
+    config.action_token_end_id = 10
+    policy = G05Policy(config)
+
+    class FakeActionTokenizer:
+        def decode(self, rows):
+            raise AssertionError("an empty row must not reach the codec")
+
+    policy._action_tokenizer = FakeActionTokenizer()
+    policy.model.sample_action_tokens = lambda batch: [torch.empty(0, dtype=torch.long)]
+    batch = {
+        OBS_LANGUAGE_TOKENS: torch.ones(1, 1, dtype=torch.long),
+        OBS_STATE: torch.zeros(1, 4),
+    }
+
+    with caplog.at_level("WARNING"):
+        actions = policy.predict_action_chunk(batch)
+
+    assert torch.count_nonzero(actions) == 0
+    assert "no ActionCodec tokens" in caplog.text
+
+
 def test_discrete_action_loss_reuses_prefix_cache() -> None:
     config = _tiny_config()
     config.discrete_action = True
@@ -402,6 +586,47 @@ def test_so100_joint_frame_transform_is_invertible() -> None:
     action_step = G05ActionFrameTransformStep(joint_signs=signs, joint_offsets=offsets)
     arm_action = action_step({TransitionKey.ACTION: model_state})[TransitionKey.ACTION]
     assert torch.allclose(arm_action, arm_state)
+
+    # Training actions are recorded in the arm frame and need the same forward
+    # transform as the state, otherwise the relative-action step differences two
+    # different coordinate frames.
+    forward_step = G05ActionFrameTransformStep(joint_signs=signs, joint_offsets=offsets, inverse=False)
+    model_action = forward_step({TransitionKey.ACTION: arm_state})[TransitionKey.ACTION]
+    assert torch.allclose(model_action, model_state)
+    round_tripped = action_step({TransitionKey.ACTION: model_action})[TransitionKey.ACTION]
+    assert torch.allclose(round_tripped, arm_state)
+
+
+def test_joint_signs_must_stay_invertible() -> None:
+    config = _tiny_config()
+    config.joint_signs = [0.5, 1.0]
+    config.joint_offsets = [0.0, 0.0]
+    with pytest.raises(ValueError, match="invertible"):
+        config.__post_init__()
+
+    config.joint_signs = [1.0, -1.0]
+    config.__post_init__()
+
+
+def test_training_pipeline_transforms_state_and_action_into_one_frame(monkeypatch) -> None:
+    from transformers import AutoTokenizer
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", lambda *args, **kwargs: object())
+    config = _tiny_config()
+    config.joint_signs = [1.0, -1.0]
+    config.joint_offsets = [0.0, 90.0]
+    config.__post_init__()
+
+    preprocessor, _ = make_g05_pre_post_processors(
+        config,
+        {
+            OBS_STATE: {"q01": torch.full((3,), -1.0), "q99": torch.full((3,), 1.0)},
+            ACTION: {"q01": torch.full((2,), -1.0), "q99": torch.full((2,), 1.0)},
+        },
+        tokenizer_path="artifact/processor",
+    )
+    frame_steps = [step for step in preprocessor.steps if isinstance(step, G05ActionFrameTransformStep)]
+    assert [step.inverse for step in frame_steps] == [False]
 
 
 def test_processor_factory_separates_base_and_stepwise_normalization(monkeypatch) -> None:

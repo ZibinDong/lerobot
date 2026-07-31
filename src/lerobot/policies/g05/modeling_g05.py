@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import copy
+import logging
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from einops import rearrange, repeat
@@ -52,6 +53,19 @@ else:
     G05GatedDeltaNet = None
     G05VisionPatchEmbed = None
     G05VisionPatchMerger = None
+
+
+class CotGeneration(NamedTuple):
+    """Per-row state carried from the CoT stage into the AR action stage.
+
+    ``stop_tokens`` is the token that actually terminated each row. The AR stage
+    must commit that exact token rather than re-decoding the frozen hidden state,
+    which is not reproducible once ``ar_do_sample`` is enabled. ``history`` keeps
+    the CoT tokens visible to the repetition penalties during the action stage.
+    """
+
+    stop_tokens: Tensor
+    history: Tensor | None
 
 
 class G05Model(nn.Module):
@@ -352,7 +366,7 @@ class G05Model(nn.Module):
         self,
         batch: dict[str, Tensor],
         prefix: tuple[DynamicCache, Tensor, Tensor, Tensor, Tensor],
-    ) -> tuple[DynamicCache, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[tuple[DynamicCache, Tensor, Tensor, Tensor, Tensor], CotGeneration]:
         """Extend the VLM prefix until every sample emits EOV or EOS.
 
         The released SO101 checkpoint conditions its flow expert on this generated
@@ -360,9 +374,15 @@ class G05Model(nn.Module):
         to the cache, matching the source inference pipeline. Rows that finish early
         receive masked cache slots while other rows continue; their recurrent linear
         attention state is restored after each padded forward.
+
+        The returned :class:`CotGeneration` carries each row's stop token so the AR
+        action stage can commit it verbatim, and the CoT tokens so the repetition
+        penalties stay continuous across both stages. Rows that exhaust the token
+        budget without stopping report ``-1`` and are simply sampled onwards.
         """
         cache, position_ids, attention_mask, last_hidden, input_ids = prefix
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        stop_tokens = torch.full_like(input_ids[:, 0], -1)
         stop_ids = {self.config.eos_token_id}
         if self.config.eov_token_id is not None:
             stop_ids.add(self.config.eov_token_id)
@@ -373,6 +393,7 @@ class G05Model(nn.Module):
             is_stop = torch.zeros_like(finished)
             for token_id in stop_ids:
                 is_stop |= next_token.eq(token_id)
+            stop_tokens = torch.where(is_stop & (~finished), next_token, stop_tokens)
             finished |= is_stop
             if bool(finished.all()):
                 break
@@ -418,7 +439,10 @@ class G05Model(nn.Module):
                 last_hidden,
                 outputs.last_hidden_state,
             )
-        return cache, position_ids, attention_mask, last_hidden, input_ids
+        return (
+            (cache, position_ids, attention_mask, last_hidden, input_ids),
+            CotGeneration(stop_tokens=stop_tokens, history=generated_history),
+        )
 
     @torch.no_grad()
     def sample_action_tokens(self, batch: dict[str, Tensor]) -> list[Tensor]:
@@ -429,8 +453,9 @@ class G05Model(nn.Module):
         measured independently.
         """
         prefix = self.prefill(batch)
+        cot: CotGeneration | None = None
         if self.config.predict_cot:
-            prefix = self.generate_cot(batch, prefix)
+            prefix, cot = self.generate_cot(batch, prefix)
         cache, _, attention_mask, last_hidden, input_ids = prefix
         start = self.config.action_token_start_id
         end = self.config.action_token_end_id
@@ -442,10 +467,17 @@ class G05Model(nn.Module):
         action_started = torch.zeros_like(finished)
         generated: list[list[Tensor]] = [[] for _ in range(batch_size)]
         full_ids = input_ids
-        generated_history = None
+        # Repetition penalties stay continuous across the CoT and action stages.
+        generated_history = cot.history if cot is not None else None
+        eov_token_id = self.config.eov_token_id
 
-        for _ in range(self.config.max_action_tokens):
+        for step in range(self.config.max_action_tokens):
             next_token = self.sample_next_token(self.output_proj(last_hidden[:, -1]), generated_history)
+            if step == 0 and cot is not None:
+                # CoT stopped before committing its stop token. Re-decoding the
+                # frozen hidden state would draw a fresh sample under
+                # ar_do_sample, so commit the token the row actually emitted.
+                next_token = torch.where(cot.stop_tokens.ge(0), cot.stop_tokens, next_token)
             is_action = next_token.ge(start) & next_token.lt(end)
             live_action = (~finished) & is_action
             for batch_index in live_action.nonzero(as_tuple=False).flatten().tolist():
@@ -455,7 +487,9 @@ class G05Model(nn.Module):
             # the source pipeline does. The AR action stage consumes that one EOV
             # transition token, then collects the contiguous ActionCodec payload.
             transition_eov = (
-                self.config.predict_cot & (~action_started) & next_token.eq(self.config.eov_token_id)
+                torch.zeros_like(finished)
+                if eov_token_id is None
+                else self.config.predict_cot & (~action_started) & next_token.eq(eov_token_id)
             )
             finished |= ~(is_action | transition_eov)
             action_started |= live_action
@@ -626,7 +660,7 @@ class G05Model(nn.Module):
         """Integrate the learned velocity field from Gaussian noise to actions."""
         prefix = self.prefill(batch)
         if self.config.predict_cot:
-            prefix = self.generate_cot(batch, prefix)
+            prefix, _ = self.generate_cot(batch, prefix)
         prefix_cache, prefix_position_ids, prefix_attention_mask, _, _ = prefix
         input_ids = batch[OBS_LANGUAGE_TOKENS]
         batch_size = input_ids.shape[0]
@@ -798,8 +832,16 @@ class G05Policy(PreTrainedPolicy):
                     raise RuntimeError("AR inference requires the artifact's ActionCodec tokenizer")
                 token_rows = self.model.sample_action_tokens(batch)
                 decoded_rows = []
-                for row in token_rows:
+                for index, row in enumerate(token_rows):
                     if row.numel() == 0:
+                        # A zero chunk still commands the arm, so make the cause
+                        # visible instead of letting it look like a real action.
+                        logging.warning(
+                            "G0.5 AR inference produced no ActionCodec tokens for batch row %d; "
+                            "falling back to a zero action chunk. Check predict_cot, the "
+                            "action-token range, and the AR sampling configuration.",
+                            index,
+                        )
                         decoded = batch[OBS_STATE].new_zeros(
                             self.config.chunk_size, self.config.internal_action_dim
                         )

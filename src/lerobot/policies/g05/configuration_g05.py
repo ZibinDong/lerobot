@@ -238,6 +238,11 @@ class G05Config(PreTrainedConfig):
         if (self.joint_signs is None) != (self.joint_offsets is None):
             raise ValueError("joint_signs and joint_offsets must be configured together")
         if self.joint_signs is not None:
+            # The postprocessor inverts the frame transform as
+            # ``signs * (action - offsets)``, which only undoes
+            # ``signs * state + offsets`` when every sign is +1 or -1.
+            if any(abs(sign) != 1 for sign in self.joint_signs):
+                raise ValueError("joint_signs entries must be +1 or -1 to stay invertible")
             state = (self.input_features or {}).get(OBS_STATE)
             action = (self.output_features or {}).get(ACTION)
             physical_dims = {feature.shape[-1] for feature in (state, action) if feature is not None}

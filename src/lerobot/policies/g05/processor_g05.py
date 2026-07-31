@@ -255,10 +255,19 @@ class G05StateFrameTransformStep(ProcessorStep):
 @ProcessorStepRegistry.register(name="g05_action_frame_transform")
 @dataclass
 class G05ActionFrameTransformStep(ProcessorStep):
-    """Convert checkpoint-frame actions back into the physical arm frame."""
+    """Move actions between the physical-arm and checkpoint coordinate frames.
+
+    ``inverse=True`` is the deployment direction and undoes
+    :class:`G05StateFrameTransformStep` on a predicted action. ``inverse=False``
+    is the training direction: dataset actions are recorded in the physical arm
+    frame, so they need the same forward transform as the state before the
+    relative-action step differences them. Inference transitions carry no action
+    on the input side, which makes the forward instance a no-op there.
+    """
 
     joint_signs: list[float] | None = None
     joint_offsets: list[float] | None = None
+    inverse: bool = True
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         if self.joint_signs is None or self.joint_offsets is None:
@@ -271,12 +280,19 @@ class G05ActionFrameTransformStep(ProcessorStep):
         width = len(self.joint_signs)
         signs = action.new_tensor(self.joint_signs)
         offsets = action.new_tensor(self.joint_offsets)
-        action[..., :width] = signs * (action[..., :width] - offsets)
+        if self.inverse:
+            action[..., :width] = signs * (action[..., :width] - offsets)
+        else:
+            action[..., :width] = signs * action[..., :width] + offsets
         transition[TransitionKey.ACTION] = action
         return transition
 
     def get_config(self) -> dict[str, Any]:
-        return {"joint_signs": self.joint_signs, "joint_offsets": self.joint_offsets}
+        return {
+            "joint_signs": self.joint_signs,
+            "joint_offsets": self.joint_offsets,
+            "inverse": self.inverse,
+        }
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
@@ -587,6 +603,11 @@ def make_g05_pre_post_processors(
             G05StateFrameTransformStep(
                 joint_signs=config.joint_signs,
                 joint_offsets=config.joint_offsets,
+            ),
+            G05ActionFrameTransformStep(
+                joint_signs=config.joint_signs,
+                joint_offsets=config.joint_offsets,
+                inverse=False,
             ),
             relative_step,
             steps.to_device,
