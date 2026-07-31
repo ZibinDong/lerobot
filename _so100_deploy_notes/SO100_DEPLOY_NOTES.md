@@ -1,7 +1,7 @@
 # G0.5
 
 本文档记录 LeRobot G0.5 集成、旧格式 checkpoint 转换、SO100
-部署方法，以及 2026-07-30 实机测试中已经解决和仍未解决的问题。
+部署方法，以及 2026-07-30 至 2026-07-31 实机测试中已经解决和仍未解决的问题。
 
 ## 当前状态
 
@@ -17,15 +17,46 @@
 - converted artifact 可被 `strict=True` 加载，并可完成离线 dummy inference。
 - G0.5 针对性单元测试和 Ruff 检查已通过。
 
-但 SO100 实机部署目前**不能认为已经完成对齐**：
+截至 2026-07-31，SO100 的 AR 离散动作部署已经完成以下验证：
 
 - 机械臂、两路相机和旧校准文件均已成功接入。
-- 20 秒实机 rollout 能完整运行且能输出动作。
-- 实际抓取效果很差，没有完成“把红色 block 放入蓝色碗”的任务。
-- 原始部署客户端和 LeRobot rollout 的控制链路仍有数处差异，详见
-  [尚未解决的问题](#尚未解决的问题)。
+- ActionCodec parts 顺序错误已经修复；转换权重可正确映射 SO100 的六维动作。
+- 使用官方 `lerobot-rollout`、greedy AR、10 度安全限幅和
+  `torch.compile` 的 120 秒实机命令能够成功启动并执行 rollout。
+- 下面记录的命令是当前实机验证基线；旧的 3 度、20 秒测试仅保留为历史记录。
 
-在完成同输入离线对照和控制链路对齐前，不应继续反复进行实机试错。
+## 2026-07-31 实机验证命令
+
+以下命令已在本机成功完成模型加载、`torch.compile` 推理和 SO100 实机
+rollout。`return_to_initial_position=true` 会在 rollout 结束后返回命令启动时
+记录的关节位置，而不是自动返回 G0.5 的 home pose。
+
+```bash
+cd /home/galaxea/zibin.dong/lerobot
+
+uv run lerobot-rollout \
+  --strategy.type=base \
+  --policy.path=/home/galaxea/zibin.dong/lerobot/outputs/checkpoints/g05-so100-opensource-16node-resampled30fps-lerobot \
+  --policy.predict_cot=true \
+  --policy.discrete_action=true \
+  --policy.continuous_action=false \
+  --policy.ar_do_sample=false \
+  --robot.type=so100_follower \
+  --robot.id=g05_so100_follower \
+  --robot.port=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5970073357-if00 \
+  --robot.use_degrees=true \
+  --robot.max_relative_target=10 \
+  --robot.disable_torque_on_disconnect=false \
+  --robot.cameras="{exterior_rgb: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: MJPG, backend: 200}, right_wrist_rgb: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: MJPG, backend: 200}}" \
+  --task="pick up the red block and put it into the blue bowl" \
+  --fps=30 \
+  --duration=120 \
+  --return_to_initial_position=true \
+  --device=cuda \
+  --use_torch_compile=true
+```
+
+首次动作块会包含 TorchInductor 编译开销，后续推理复用编译缓存。
 
 ## 本次代码更新
 
