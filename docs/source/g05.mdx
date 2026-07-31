@@ -145,6 +145,59 @@ uv run lerobot-rollout \
 
 Use `--robot.type=so100_follower` unchanged for SO100. `max_relative_target` is a controller-side safety limit on the change between the current and commanded absolute target; tune it conservatively for the physical setup.
 
+### Split policy server and robot client
+
+`lerobot-rollout` runs the policy on the machine holding the arm. To keep
+inference on a separate GPU host, run the async pair instead. Neither side has a
+console script; both are launched as modules.
+
+Start the policy server on the GPU host. It comes up empty: the client names the
+policy during the first handshake, so no checkpoint is given here.
+
+```bash
+python -m lerobot.async_inference.policy_server \
+  --host=0.0.0.0 \
+  --port=8080
+```
+
+Then start the client on the machine wired to the arm. `--pretrained_name_or_path`
+is resolved on the **server**, so it must be a path the server can read.
+
+```bash
+python -m lerobot.async_inference.robot_client \
+  --server_address=127.0.0.1:8080 \
+  --robot.type=so100_follower \
+  --robot.port=/dev/ttyACM0 \
+  --robot.id=g05_so100_follower \
+  --robot.use_degrees=true \
+  --robot.max_relative_target=5 \
+  --robot.cameras="{ exterior_rgb: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}, right_wrist_rgb: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+  --task="pick up the red block and put it into the blue bowl" \
+  --policy_type=g05 \
+  --pretrained_name_or_path=/path/to/lerobot-g05-so100 \
+  --policy_device=cuda \
+  --actions_per_chunk=32 \
+  --chunk_size_threshold=0.5 \
+  --aggregate_fn_name=weighted_average \
+  --fps=30
+```
+
+Camera keys must match the artifact's `camera_keys`, exactly as for
+`lerobot-rollout`. `--fps` sets the rate at which the client consumes the chunk;
+confirm it against the frequency the checkpoint was trained and deployed at
+rather than inferring it from the checkpoint name.
+
+When the artifact sets `predict_cot=true`, the server prints the reasoning behind
+every recomputed chunk:
+
+```text
+╭─ Chain of Thought (step 42) ────────────────────────────────────────────────
+│ BBox    : blue_bowl(350,206),(464,367)
+│ Subtask : grasp and lift the red block from the table
+│ Action  :
+╰─────────────────────────────────────────────────────────────────────────────
+```
+
 ## Published checkpoint defaults
 
 All published checkpoints predict 32 actions. The recommended execution windows are 10 for LIBERO, 16 for DROID, 32 for SO101, and 16 for the base checkpoint. These values are artifact configuration, not model branches.
