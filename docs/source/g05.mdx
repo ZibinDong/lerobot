@@ -126,30 +126,66 @@ uv run lerobot-eval \
 
 SO100 and SO101 use the same six-axis LeRobot control contract. The converted artifact emits absolute degree targets in this order: `shoulder_pan.pos`, `shoulder_lift.pos`, `elbow_flex.pos`, `wrist_flex.pos`, `wrist_roll.pos`, and `gripper.pos`. Keep `robot.use_degrees=true`; the first five axes use degrees and the gripper uses its calibrated 0–100 range.
 
-The exterior camera is required and must be named `exterior_rgb`. `left_wrist_rgb` and `right_wrist_rgb` are optional; omitted wrist slots become black frames, matching the random camera-drop training pipeline. A two-camera rollout can be started with:
+The exterior camera is required and must be named `exterior_rgb`. `left_wrist_rgb` and `right_wrist_rgb` are optional; omitted wrist slots become black frames, matching the random camera-drop training pipeline.
+
+The command below is the SO100 baseline verified on hardware. It runs the
+discrete autoregressive head with chain of thought, which the converter does not
+select on its own: a checkpoint that trained both heads is converted with the
+flow-matching head enabled, so the AR head is requested explicitly here.
 
 ```bash
 uv run lerobot-rollout \
   --strategy.type=base \
-  --policy.path=/path/to/lerobot-g05-so101 \
-  --robot.type=so101_follower \
-  --robot.port=/dev/ttyACM0 \
+  --policy.path=/path/to/lerobot-g05-so100 \
+  --policy.predict_cot=true \
+  --policy.discrete_action=true \
+  --policy.continuous_action=false \
+  --policy.ar_do_sample=false \
+  --robot.type=so100_follower \
+  --robot.id=g05_so100_follower \
+  --robot.port=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5970073357-if00 \
   --robot.use_degrees=true \
-  --robot.max_relative_target=5 \
-  --robot.cameras="{ exterior_rgb: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}, right_wrist_rgb: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30}}" \
-  --task="pick up the object" \
+  --robot.max_relative_target=10 \
+  --robot.disable_torque_on_disconnect=false \
+  --robot.cameras="{exterior_rgb: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: MJPG, backend: 200}, right_wrist_rgb: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: MJPG, backend: 200}}" \
+  --task="pick up the red block and put it into the blue bowl" \
   --fps=30 \
-  --duration=60 \
-  --device=cuda
+  --duration=120 \
+  --return_to_initial_position=true \
+  --device=cuda \
+  --use_torch_compile=true
 ```
 
-Use `--robot.type=so100_follower` unchanged for SO100. `max_relative_target` is a controller-side safety limit on the change between the current and commanded absolute target; tune it conservatively for the physical setup.
+Use `--robot.type=so101_follower` for SO101. Notes on the values that matter:
+
+- `max_relative_target=10` caps how far a single command may move each joint.
+  Ten degrees matches the reference G0.5 SO100 client; smaller caps clip the
+  policy's coordinated motion and distort the trajectory.
+- The cameras are 640x480 MJPG, matching the reference client's capture
+  settings. Camera keys must match the artifact's `camera_keys`.
+- `return_to_initial_position=true` returns to the joint positions recorded when
+  the command started, not to a G0.5 home pose.
+- `use_torch_compile=true` puts TorchInductor compilation cost in the first
+  action chunk; later chunks reuse the cache.
+
+When `predict_cot` is enabled the policy prints the reasoning behind every chunk
+it predicts, from any entry point:
+
+```text
+╭─ G0.5 Chain of Thought ─────────────────────────────────────────────────────
+│ BBox    : blue_bowl(350,206),(464,367)
+│ Subtask : grasp and lift the red block from the table
+│ Action  :
+╰─────────────────────────────────────────────────────────────────────────────
+```
 
 ### Split policy server and robot client
 
-`lerobot-rollout` runs the policy on the machine holding the arm. To keep
+`lerobot-rollout` runs the policy on the machine holding the arm. To place
 inference on a separate GPU host, run the async pair instead. Neither side has a
-console script; both are launched as modules.
+console script; both are launched as modules. This path has not been validated
+on hardware for G0.5 — prefer `lerobot-rollout` above unless a split host is
+required.
 
 Start the policy server on the GPU host. It comes up empty: the client names the
 policy during the first handshake, so no checkpoint is given here.
@@ -167,50 +203,21 @@ is resolved on the **server**, so it must be a path the server can read.
 python -m lerobot.async_inference.robot_client \
   --server_address=127.0.0.1:8080 \
   --robot.type=so100_follower \
-  --robot.port=/dev/ttyACM0 \
   --robot.id=g05_so100_follower \
+  --robot.port=/dev/ttyACM0 \
   --robot.use_degrees=true \
-  --robot.max_relative_target=5 \
-  --robot.cameras="{ exterior_rgb: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}, right_wrist_rgb: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+  --robot.max_relative_target=10 \
+  --robot.cameras="{exterior_rgb: {type: opencv, index_or_path: /dev/video2, width: 640, height: 480, fps: 30, fourcc: MJPG, backend: 200}, right_wrist_rgb: {type: opencv, index_or_path: /dev/video0, width: 640, height: 480, fps: 30, fourcc: MJPG, backend: 200}}" \
   --task="pick up the red block and put it into the blue bowl" \
   --policy_type=g05 \
   --pretrained_name_or_path=/path/to/lerobot-g05-so100 \
   --policy_device=cuda \
   --actions_per_chunk=32 \
-  --chunk_size_threshold=0.0 \
-  --aggregate_fn_name=latest_only \
   --fps=30
 ```
 
-Camera keys must match the artifact's `camera_keys`, exactly as for
-`lerobot-rollout`. `--fps` sets the rate at which the client consumes the chunk;
-confirm it against the frequency the checkpoint was trained and deployed at
-rather than inferring it from the checkpoint name.
-
-The chunking flags are set to reproduce the reference G0.5 client rather than to
-maximise smoothness. `actions_per_chunk=32` serves the whole predicted chunk.
-`chunk_size_threshold=0.0` asks for a new chunk only once the queue is empty, so
-no chunk is ever recomputed from a mid-chunk observation; the default `0.5`
-requests a replacement halfway through instead. Because consecutive chunks then
-never overlap, `latest_only` is the matching aggregation — the default
-`weighted_average` blends overlapping actions, which the reference client
-explicitly does not do.
-
-The trade-off is a stall: the arm holds its last commanded target while the
-model recomputes, exactly as the reference client behaves. Raise
-`chunk_size_threshold` to overlap inference with execution once numerical parity
-has been confirmed on hardware.
-
-When the artifact sets `predict_cot=true`, the server prints the reasoning behind
-every recomputed chunk:
-
-```text
-╭─ Chain of Thought (step 42) ────────────────────────────────────────────────
-│ BBox    : blue_bowl(350,206),(464,367)
-│ Subtask : grasp and lift the red block from the table
-│ Action  :
-╰─────────────────────────────────────────────────────────────────────────────
-```
+Unlike `lerobot-rollout`, the client cannot pass `--policy.*` overrides, so the
+artifact must already select the head to serve.
 
 ## Published checkpoint defaults
 
