@@ -42,6 +42,7 @@ class G05ActionCodecConfig(PretrainedConfig):
         commitment_loss_weight: float = 0.25,
         reconstruction_loss_weight: float = 1.0,
         parts_meta: dict[str, int] | None = None,
+        parts_order: list[str] | None = None,
         rule_based_key_patterns: list[str] | None = None,
         rule_based_min_block_len: int = 1,
         rule_based_binarize_threshold: float = 0.0,
@@ -79,6 +80,12 @@ class G05ActionCodecConfig(PretrainedConfig):
         self.commitment_loss_weight = commitment_loss_weight
         self.reconstruction_loss_weight = reconstruction_loss_weight
         self.parts_meta = parts_meta or {}
+        # parts_meta's key order defines the checkpoint's flat action layout, but
+        # PretrainedConfig.to_json_string serialises with sort_keys=True, which
+        # silently alphabetises it. Keep the canonical order in a list, which
+        # JSON preserves. Artifacts written before this field existed fall back
+        # to the dict order, which is what they were already decoded with.
+        self.parts_order = list(parts_order) if parts_order else list(self.parts_meta)
         self.rule_based_key_patterns = rule_based_key_patterns or ["gripper"]
         self.rule_based_min_block_len = rule_based_min_block_len
         self.rule_based_binarize_threshold = rule_based_binarize_threshold
@@ -94,6 +101,13 @@ class G05ActionCodecConfig(PretrainedConfig):
             raise ValueError("num_residuals must be between 1 and n_codebooks")
         if any(width > max_component_dim for width in self.parts_meta.values()):
             raise ValueError("released G0.5 ActionCodec does not support parts wider than max_component_dim")
+        if set(self.parts_order) != set(self.parts_meta):
+            raise ValueError("parts_order must list exactly the parts_meta keys")
+
+    @property
+    def ordered_parts_meta(self) -> dict[str, int]:
+        """parts_meta in the checkpoint's canonical layout order."""
+        return {name: self.parts_meta[name] for name in self.parts_order}
 
     @property
     def code_height(self) -> int:

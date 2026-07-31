@@ -925,6 +925,92 @@ def test_action_codec_grouped_token_roundtrip() -> None:
     torch.testing.assert_close(decoded[..., -1], action[..., -1])
 
 
+def _codec_config(**overrides) -> G05ActionCodecConfig:
+    base = {
+        "max_component_dim": 3,
+        "horizon": 4,
+        "horizon_patch_size": 2,
+        "conv_in_action_kernel": 2,
+        "encoder_channels": 8,
+        "latent_dim": 4,
+        "c_mults": [1],
+        "strides": [[1, 1]],
+        "transformer_depths": [1],
+        "num_heads": 1,
+        "dim_heads": 32,
+        "use_block_dct": True,
+        "block_dct_block_size": 2,
+        "n_codebooks": 1,
+        "codebook_size": 16,
+        "codebook_dim": 2,
+        "num_residuals": 1,
+    }
+    base.update(overrides)
+    return G05ActionCodecConfig(**base)
+
+
+def test_parts_order_survives_config_serialisation(tmp_path) -> None:
+    """parts_meta's key order is the action layout, and saved JSON sorts keys.
+
+    The released SO100 checkpoint orders its parts right_control before
+    lower_body, which is not alphabetical, so relying on the dict order
+    silently permutes every decoded action dimension after a round trip.
+    """
+    canonical = ["right_control", "right_gripper", "lower_body"]
+    config = _codec_config(
+        parts_meta={"right_control": 2, "right_gripper": 1, "lower_body": 3},
+        parts_order=canonical,
+    )
+    config.save_pretrained(tmp_path)
+
+    reloaded = G05ActionCodecConfig.from_pretrained(tmp_path)
+    assert list(reloaded.parts_meta) == sorted(reloaded.parts_meta)
+    assert reloaded.parts_order == canonical
+    assert list(reloaded.ordered_parts_meta) == canonical
+
+
+def test_tokenizer_lays_out_parts_in_canonical_order() -> None:
+    """The decoded chunk follows parts_order, not the alphabetised parts_meta."""
+    canonical = ["right_control", "gripper", "lower_body"]
+    config = _codec_config(
+        parts_meta={"right_control": 2, "gripper": 1, "lower_body": 3},
+        parts_order=canonical,
+    )
+    tokenizer = G05ActionTokenizer(G05ActionCodecModel(config))
+    assert list(tokenizer.parts_meta) == canonical
+
+    # The gripper column is rule-coded and round-trips exactly, so it pins the
+    # slot the layout assigns it: index 2, straight after right_control's width.
+    action = torch.zeros(1, 4, 6)
+    action[..., 2] = torch.tensor([-1.0, -1.0, 1.0, 1.0])
+    decoded = tokenizer.decode_action_indices(tokenizer.encode_action_indices(action))
+    assert decoded.shape == (1, 4, 6)
+    torch.testing.assert_close(decoded[..., 2], action[..., 2])
+
+
+def test_greedy_decoding_ignores_repetition_penalties() -> None:
+    """Greedy AR must be a plain argmax, matching the source decoder.
+
+    The source forces temperature to zero when do_sample is false and returns
+    argmax before the repetition penalty or the n-gram ban is applied. Applying
+    them here suppresses the legitimately repeated ActionCodec tokens that
+    released checkpoints emit, and the AR chunk then diverges.
+    """
+    config = _tiny_config()
+    config.ar_do_sample = False
+    config.ar_repetition_penalty = 1.2
+    config.ar_no_repeat_ngram_size = 3
+    model = G05Policy(config).model
+
+    logits = torch.zeros(1, 100)
+    logits[0, 7] = 5.0
+    logits[0, 8] = 4.0
+    history = torch.tensor([[7, 7, 7]])
+
+    # 7 already dominates and is heavily repeated; a penalised argmax picks 8.
+    assert model.sample_next_token(logits, history).tolist() == [7]
+
+
 def test_stepwise_normalization_and_restore() -> None:
     specs = [
         {

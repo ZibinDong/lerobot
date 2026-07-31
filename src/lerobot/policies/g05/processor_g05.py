@@ -381,11 +381,17 @@ class G05PrepareInputsStep(ProcessorStep):
             # Checking dtype avoids a GPU synchronization for every camera slot.
             value = value.float() / 255 if value.dtype == torch.uint8 else value.float()
             if (height, width) != tuple(self.image_size):
+                # antialias mirrors torchvision.transforms.Resize, which the G0.5
+                # training pipeline applies. Camera frames are downscaled by ~2x,
+                # so sampling without the low-pass filter aliases hard edges: on
+                # the released SO100 checkpoint that moved pixels by up to 0.27
+                # on the [-1, 1] scale and the predicted chunk by whole degrees.
                 value = functional.interpolate(
                     value.reshape(batch_size * steps, channels, height, width),
                     size=self.image_size,
                     mode="bilinear",
                     align_corners=False,
+                    antialias=True,
                 ).reshape(batch_size, steps, channels, *self.image_size)
             images.append(value * 2 - 1)
         return torch.stack(images, dim=1)

@@ -321,7 +321,18 @@ class G05Model(nn.Module):
         return destination
 
     def sample_next_token(self, logits: Tensor, history: Tensor | None = None) -> Tensor:
-        """Apply the AR sampling contract serialized from the source checkpoint."""
+        """Apply the AR sampling contract serialized from the source checkpoint.
+
+        Greedy decoding deliberately ignores the repetition penalty and the
+        n-gram ban: the source decoder forces temperature to zero when
+        ``do_sample`` is false and returns a plain argmax before either
+        constraint is applied. Honouring the penalties here instead would
+        suppress the legitimately repeated ActionCodec tokens that released
+        checkpoints emit, and the AR chunk then diverges from the reference.
+        """
+        if not self.config.ar_do_sample or self.config.ar_temperature == 0:
+            return logits.float().argmax(dim=-1)
+
         scores = logits.float().clone()
         if history is not None and history.numel():
             if self.config.ar_repetition_penalty != 1:
@@ -344,9 +355,6 @@ class G05Model(nn.Module):
                     }
                     if banned:
                         scores[batch_index, list(banned)] = -torch.inf
-
-        if not self.config.ar_do_sample or self.config.ar_temperature == 0:
-            return scores.argmax(dim=-1)
 
         scores /= self.config.ar_temperature
         top_k = min(self.config.ar_top_k, scores.shape[-1])

@@ -487,6 +487,12 @@ def _save_action_tokenizer(
         )
         if name in tokenizer_config
     }
+    # The Hydra mapping order is the checkpoint's flat action layout. Serialise it
+    # explicitly: the saved JSON sorts object keys, so relying on parts_meta's own
+    # order silently permutes the decoded action dimensions for any embodiment
+    # whose canonical part order is not alphabetical.
+    if "parts_meta" in frontend_fields:
+        frontend_fields["parts_order"] = list(frontend_fields["parts_meta"])
     config = G05ActionCodecConfig(**tokenizer_config["model_arch"], **frontend_fields)
 
     if checkpoint_path.is_dir():
