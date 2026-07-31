@@ -479,3 +479,18 @@ def test_format_chain_of_thought_handles_empty_text():
 
     assert "(empty)" in format_chain_of_thought("")
     assert "(empty)" in format_chain_of_thought(None)
+
+
+def test_g05_is_servable_by_the_policy_server():
+    """The server rejects any policy_type outside this allowlist at handshake.
+
+    g05 is an action-chunking policy with a factory entry, so omitting it makes
+    the documented server/client launch fail before inference starts.
+    """
+    from lerobot.async_inference.constants import SUPPORTED_POLICIES
+    from lerobot.policies.factory import get_policy_class
+
+    assert "g05" in SUPPORTED_POLICIES
+    for policy_type in SUPPORTED_POLICIES:
+        # Every advertised type must be resolvable by the server's loader.
+        assert get_policy_class(policy_type) is not None
