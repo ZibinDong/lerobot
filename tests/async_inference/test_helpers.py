@@ -452,3 +452,30 @@ def test_image_processing_pipeline_preserves_content():
     corner_val = processed_img[:, 5, 5].mean()  # Corner
 
     assert center_val > corner_val, "Image processing should preserve recognizable patterns"
+
+
+def test_format_chain_of_thought_splits_segments_and_strips_markup():
+    from lerobot.async_inference.helpers import format_chain_of_thought
+
+    cot = (
+        "BBox: <|object_ref_start|>blue_bowl<|object_ref_end|>"
+        "<|box_start|>(350,206),(464,367)<|box_end|>"
+        "|Subtask: grasp and lift the red block|Action: "
+    )
+    block = format_chain_of_thought(cot, step=42)
+    lines = block.splitlines()
+
+    assert "Chain of Thought (step 42)" in lines[0]
+    # Grounding markup is dropped, and each segment gets its own aligned row.
+    assert "<|" not in block
+    assert any(line.startswith("│ BBox") and "blue_bowl(350,206),(464,367)" in line for line in lines)
+    assert any("Subtask" in line and "grasp and lift the red block" in line for line in lines)
+    labels = [line.split(":")[0] for line in lines if line.startswith("│ ") and ":" in line]
+    assert len({len(label) for label in labels}) == 1, "labels should be padded to one width"
+
+
+def test_format_chain_of_thought_handles_empty_text():
+    from lerobot.async_inference.helpers import format_chain_of_thought
+
+    assert "(empty)" in format_chain_of_thought("")
+    assert "(empty)" in format_chain_of_thought(None)

@@ -55,6 +55,7 @@ from .helpers import (
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    format_chain_of_thought,
     get_logger,
     observations_similar,
     raw_observation_to_observation,
@@ -319,6 +320,22 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
+    def _log_chain_of_thought(self, step: int | None = None) -> None:
+        """Print the reasoning a CoT policy produced for the chunk just predicted.
+
+        Policies that do not generate chain of thought expose no ``last_cot_text``
+        and are silently skipped, so this stays a no-op for ACT, SmolVLA, and the
+        rest.
+        """
+        texts = getattr(self.policy, "last_cot_text", None)
+        if not texts:
+            return
+        for index, text in enumerate(texts):
+            if not text or not text.strip():
+                continue
+            label = step if len(texts) == 1 else f"{step}, batch {index}"
+            self.logger.info("\n%s", format_chain_of_thought(text, step=label))
+
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
         """Get an action chunk from the policy. The chunk contains only"""
         chunk = self.policy.predict_action_chunk(observation)
@@ -359,6 +376,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
         )
+        self._log_chain_of_thought(observation_t.get_timestep())
 
         """4. Apply postprocessor"""
         # Apply postprocessor (handles unnormalization and device movement)

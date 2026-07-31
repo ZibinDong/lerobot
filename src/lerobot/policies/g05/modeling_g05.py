@@ -389,6 +389,7 @@ class G05Model(nn.Module):
         budget without stopping report ``-1`` and are simply sampled onwards.
         """
         cache, position_ids, attention_mask, last_hidden, input_ids = prefix
+        prompt_length = input_ids.shape[1]
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         stop_tokens = torch.full_like(input_ids[:, 0], -1)
         stop_ids = {self.config.eos_token_id}
@@ -447,6 +448,9 @@ class G05Model(nn.Module):
                 last_hidden,
                 outputs.last_hidden_state,
             )
+        # Kept so deployments can surface the reasoning the chunk was conditioned
+        # on; the stop token is excluded because it is never committed.
+        self.last_cot_tokens = input_ids[:, prompt_length:].detach()
         return (
             (cache, position_ids, attention_mask, last_hidden, input_ids),
             CotGeneration(stop_tokens=stop_tokens, history=generated_history),
@@ -713,6 +717,21 @@ class G05Policy(PreTrainedPolicy):
         self._action_queue: deque[Tensor] = deque(maxlen=config.n_action_steps)
         self._physical_action_dim = config.output_features[ACTION].shape[-1]
         self._action_tokenizer = None
+        self._text_tokenizer = None
+
+    @property
+    def last_cot_text(self) -> list[str] | None:
+        """Chain of thought generated for the most recent chunk, one per batch row.
+
+        ``None`` until a CoT-enabled inference has run, or when the artifact's
+        text tokenizer was not loaded.
+        """
+        tokens = getattr(self.model, "last_cot_tokens", None)
+        if tokens is None or self._text_tokenizer is None:
+            return None
+        return [
+            self._text_tokenizer.decode(row, skip_special_tokens=False).strip() for row in tokens.tolist()
+        ]
 
     @classmethod
     def _load_as_safetensor(
@@ -751,7 +770,9 @@ class G05Policy(PreTrainedPolicy):
         # randomly initializing a throwaway full-size CPU model before loading.
         with torch.device("meta"):
             policy = super().from_pretrained(pretrained_name_or_path, **kwargs)
-        if not policy.config.discrete_action:
+        # The text tokenizer is also needed to render generated chain of thought,
+        # so it is loaded whenever either feature is enabled.
+        if not policy.config.discrete_action and not policy.config.predict_cot:
             return policy
 
         artifact_root = Path(pretrained_name_or_path)
@@ -771,12 +792,16 @@ class G05Policy(PreTrainedPolicy):
             )
         from transformers import AutoTokenizer
 
-        from .action_tokenizer import G05ActionCodecModel, G05ActionTokenizer
-
         text_tokenizer = AutoTokenizer.from_pretrained(
             artifact_root / policy.config.tokenizer_subdir,
             local_files_only=True,
         )
+        policy._text_tokenizer = text_tokenizer
+        if not policy.config.discrete_action:
+            return policy
+
+        from .action_tokenizer import G05ActionCodecModel, G05ActionTokenizer
+
         codec = G05ActionCodecModel.from_pretrained(
             artifact_root / policy.config.action_tokenizer_subdir,
             local_files_only=True,
