@@ -15,7 +15,6 @@
 import logging
 import logging.handlers
 import os
-import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,38 +48,6 @@ LeRobotObservation = dict[str, torch.Tensor]
 
 # observation, ready for policy inference (image keys resized)
 Observation = dict[str, torch.Tensor]
-
-
-_COT_SPECIAL_TOKEN = re.compile(r"<\|[a-z_]+\|>")
-_COT_RULE_WIDTH = 78
-
-
-def format_chain_of_thought(text: str, *, step: object = None) -> str:
-    """Render generated chain of thought as a readable block.
-
-    G0.5 emits its reasoning as ``|``-separated ``Label: value`` segments with
-    grounding markup interleaved, which is unreadable on a single log line.
-    Segments get their own row and labels are aligned. The block deliberately has
-    no right border, so wide characters can never break the layout.
-    """
-    cleaned = _COT_SPECIAL_TOKEN.sub("", text or "").strip()
-    title = "Chain of Thought" if step is None else f"Chain of Thought (step {step})"
-    lines = ["╭─ " + title + " " + "─" * max(0, _COT_RULE_WIDTH - len(title) - 4)]
-
-    segments = [part.strip() for part in cleaned.split("|") if part.strip()]
-    if not segments:
-        lines.append("│ (empty)")
-    else:
-        split = [segment.split(":", 1) for segment in segments]
-        width = max((len(pair[0]) for pair in split if len(pair) == 2), default=0)
-        for pair in split:
-            if len(pair) == 2:
-                label, value = pair[0].strip(), pair[1].strip()
-                lines.append(f"│ {label:<{width}} : {value}".rstrip())
-            else:
-                lines.append(f"│ {pair[0].strip()}")
-    lines.append("╰" + "─" * (_COT_RULE_WIDTH - 1))
-    return "\n".join(lines)
 
 
 def visualize_action_queue_size(action_queue_size: list[int]) -> None:

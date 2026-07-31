@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -53,6 +54,35 @@ else:
     G05GatedDeltaNet = None
     G05VisionPatchEmbed = None
     G05VisionPatchMerger = None
+
+
+_COT_SPECIAL_TOKEN = re.compile(r"<\|[a-z_]+\|>")
+_COT_RULE_WIDTH = 78
+
+
+def format_chain_of_thought(text: str) -> str:
+    """Render a generated chain of thought as a readable block.
+
+    G0.5 emits reasoning as ``|``-separated ``Label: value`` segments with
+    grounding markup interleaved, which is unreadable on a single log line. Each
+    segment gets its own row with labels aligned. The block has no right border,
+    so wide characters can never break the layout.
+    """
+    cleaned = _COT_SPECIAL_TOKEN.sub("", text or "").strip()
+    lines = ["╭─ G0.5 Chain of Thought " + "─" * (_COT_RULE_WIDTH - 24)]
+    segments = [part.strip() for part in cleaned.split("|") if part.strip()]
+    if not segments:
+        lines.append("│ (empty)")
+    else:
+        split = [segment.split(":", 1) for segment in segments]
+        width = max((len(pair[0]) for pair in split if len(pair) == 2), default=0)
+        for pair in split:
+            if len(pair) == 2:
+                lines.append(f"│ {pair[0].strip():<{width}} : {pair[1].strip()}".rstrip())
+            else:
+                lines.append(f"│ {pair[0].strip()}")
+    lines.append("╰" + "─" * (_COT_RULE_WIDTH - 1))
+    return "\n".join(lines)
 
 
 class CotGeneration(NamedTuple):
@@ -882,8 +912,20 @@ class G05Policy(PreTrainedPolicy):
                         decoded = self._action_tokenizer.decode(row.unsqueeze(0))[0]
                     decoded_rows.append(decoded)
                 actions = torch.stack(decoded_rows)
+        self._log_chain_of_thought()
         indices = self.config.action_indices or list(range(self._physical_action_dim))
         return actions[..., indices]
+
+    def _log_chain_of_thought(self) -> None:
+        """Print the reasoning this chunk was conditioned on.
+
+        Lives here rather than in a runner so every entry point that predicts a
+        chunk -- rollout, the async policy server, eval -- shows it without each
+        one having to know about G0.5.
+        """
+        for text in self.last_cot_text or []:
+            if text.strip():
+                logging.info("\n%s", format_chain_of_thought(text))
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:

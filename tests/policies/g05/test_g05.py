@@ -1068,3 +1068,62 @@ def test_libero_boundary_matches_g05_state_and_gripper_contract() -> None:
     transition = {TransitionKey.ACTION: torch.tensor([[0.0, 0.49], [0.0, 0.51]])}
     action = G05LiberoActionStep()(transition)[TransitionKey.ACTION]
     torch.testing.assert_close(action[..., -1], torch.tensor([1.0, -1.0]))
+
+
+def test_format_chain_of_thought_splits_segments_and_strips_markup() -> None:
+    from lerobot.policies.g05.modeling_g05 import format_chain_of_thought
+
+    cot = (
+        "BBox: <|object_ref_start|>blue_bowl<|object_ref_end|>"
+        "<|box_start|>(350,206),(464,367)<|box_end|>"
+        "|Subtask: grasp and lift the red block|Action: "
+    )
+    lines = format_chain_of_thought(cot).splitlines()
+
+    assert "<|" not in "\n".join(lines)
+    assert any(line.startswith("│ BBox") and "blue_bowl(350,206),(464,367)" in line for line in lines)
+    assert any("Subtask" in line and "grasp and lift the red block" in line for line in lines)
+    labels = [line.split(":")[0] for line in lines if line.startswith("│ ") and ":" in line]
+    assert len({len(label) for label in labels}) == 1, "labels should be padded to one width"
+    assert "(empty)" in format_chain_of_thought("")
+
+
+def test_chain_of_thought_is_logged_by_the_policy_not_the_runner(caplog) -> None:
+    """Any caller of predict_action_chunk sees the CoT, without runner support."""
+    config = _cot_ar_policy()
+    policy = G05Policy(config)
+
+    class FixedToken(torch.nn.Module):
+        def forward(self, hidden_states):
+            logits = hidden_states.new_zeros(hidden_states.shape[0], 100)
+            logits[:, 4] = 1  # EOV, ending the CoT immediately
+            return logits
+
+    policy.model.output_proj = FixedToken()
+    policy._text_tokenizer = type(
+        "_Tok", (), {"decode": staticmethod(lambda ids, **kw: "Subtask: lift the block|Action: ")}
+    )()
+    policy._action_tokenizer = type(
+        "_Codec", (), {"decode": staticmethod(lambda rows: torch.zeros(1, 2, 4))}
+    )()
+    batch = {
+        OBS_LANGUAGE_TOKENS: torch.tensor([[2, 3, 6]]),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 3, dtype=torch.bool),
+        "pixel_values": torch.randn(1, 1, 1, 3, 32, 32),
+        OBS_STATE: torch.tensor([[1.0, 2.0, 0.0, 3.0]]),
+    }
+
+    with caplog.at_level("INFO"):
+        policy.predict_action_chunk(batch)
+
+    assert "Chain of Thought" in caplog.text
+    assert "lift the block" in caplog.text
+
+
+def test_g05_is_servable_by_the_async_policy_server() -> None:
+    """The async server rejects any policy_type outside its allowlist."""
+    from lerobot.async_inference.constants import SUPPORTED_POLICIES
+    from lerobot.policies.factory import get_policy_class
+
+    assert "g05" in SUPPORTED_POLICIES
+    assert get_policy_class("g05") is G05Policy
